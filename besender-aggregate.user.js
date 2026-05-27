@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.6.0
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计。中国时间自动换算为本地时区，悬停显示原始中国时间。
+// @version      1.7.0
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按机型/SKU 反查 Anker 头程订单中的物料。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -40,14 +40,19 @@
   const API = {
     manageList:        '/retreadOptimized/getRetreadManageList',
     retreadAll:        '/retreadOptimized/retreadDataListNoPage',
+    inboundList:       '/warehouse/warehouse/inboundOrderList',
+    inboundDetail:     '/warehouse/warehouse/getInboundOrder',
   };
 
   // ── Page routing ────────────────────────────────────────────────────────
 
   function pageKind() {
     const p = location.pathname + location.hash;
-    if (/\/single\/refurbish(\b|$)/.test(p))     return 'list';
-    if (/\/single\/retreadDetail(\b|$)/.test(p)) return 'detail';
+    if (/\/single\/refurbish(\b|$)/.test(p))           return 'list';
+    if (/\/single\/retreadDetail(\b|$)/.test(p))       return 'detail';
+    // head_entry_detail is intentionally not aggregable — the panel only opens on the list page.
+    if (/\/in_order\/head_entry_detail(\b|$)/.test(p)) return 'other';
+    if (/\/in_order\/head_entry(\b|$)/.test(p))        return 'inbound';
     return 'other';
   }
 
@@ -290,10 +295,28 @@
       #${PANEL_ID} table.summary td.rate  { color: #515a6e; font-weight: 600; text-align: right; }
       #${PANEL_ID} .err-tag { color: #ed4014; cursor: help; margin-left: 4px; }
 
-      #${PANEL_ID} .empty   { color: #999; padding: 12px; text-align: center; }
-      #${PANEL_ID} .loading { color: #2d8cf0; padding: 12px; text-align: center; }
-      #${PANEL_ID} .error   { color: #ed4014; padding: 8px 12px; background: #fff1f0; border-radius: 4px; }
-      #${PANEL_ID} .hint    { color: #888; font-size: 11.5px; margin-top: 6px; }
+      #${PANEL_ID} .empty    { color: #999;    padding: 12px; text-align: center; }
+      #${PANEL_ID} .loading  { color: #2d8cf0; padding: 12px; text-align: center; }
+      #${PANEL_ID} .progress { color: #2d8cf0; padding: 10px; text-align: center; font-size: 12.5px; }
+      #${PANEL_ID} .error    { color: #ed4014; padding: 8px 12px; background: #fff1f0; border-radius: 4px; }
+      #${PANEL_ID} .hint     { color: #888;    font-size: 11.5px; margin-top: 6px; }
+
+      #${PANEL_ID} .search-form {
+        display: flex; flex-direction: column; gap: 8px;
+        margin: 10px 0; padding: 10px 12px;
+        background: #f7f9fc; border: 1px solid #eef1f6; border-radius: 6px;
+      }
+      #${PANEL_ID} .form-row { display: flex; align-items: center; gap: 8px; }
+      #${PANEL_ID} .form-row label {
+        min-width: 76px; font-size: 12px; color: #515a6e; font-weight: 600;
+      }
+      #${PANEL_ID} .form-row input[type="text"] {
+        flex: 1; padding: 5px 8px; border: 1px solid #dcdee2; border-radius: 4px;
+        font-size: 13px; color: #2c3e50; background: #fff;
+      }
+      #${PANEL_ID} .form-row.form-hint span {
+        color: #999; font-size: 11.5px;
+      }
 
       .${TIME_CLS} {
         border-bottom: 1px dotted #2d8cf0;
@@ -415,11 +438,22 @@
 
   // ── Floating action button ──────────────────────────────────────────────
 
+  function fabLabelFor(kind) {
+    if (kind === 'inbound') return '🔍 物料/机型搜索';
+    return '📊 良品/不良品聚合';
+  }
+
   function ensureFab() {
-    if (document.getElementById(FAB_ID)) return;
+    const kind  = pageKind();
+    const label = fabLabelFor(kind);
+    const existing = document.getElementById(FAB_ID);
+    if (existing) {
+      if (existing.textContent !== label) existing.textContent = label;
+      return;
+    }
     const fab = document.createElement('div');
     fab.id = FAB_ID;
-    fab.textContent = '📊 良品/不良品聚合';
+    fab.textContent = label;
     fab.addEventListener('click', togglePanel);
     document.body.appendChild(fab);
   }
@@ -435,6 +469,7 @@
 
   function openPanel() {
     const kind = pageKind();
+    if (kind === 'inbound') { openInboundPanel(); return; }
     const today = localTodayStr();
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
@@ -825,6 +860,332 @@
     refresh();
   }
 
+  // ── Inbound page (头程入库) material/model lookup ───────────────────────
+
+  function openInboundPanel() {
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.dataset.panelKind = 'inbound';
+    panel.innerHTML = `
+      <header>
+        <span class="title">头程入库 - 物料/机型搜索</span>
+        <span class="close" title="关闭">✕</span>
+      </header>
+      <div class="body">
+        <div class="hint">
+          输入<b>机型</b>（2080 / 2280 / 2351 / 2353，2352 物料计入 2353）<i>或</i> <b>SKU/产品名</b>，
+          脚本会拉取当前筛选下所有 <b>Anker</b> 头程入库订单的详情并聚合命中物料。
+        </div>
+        <div class="search-form">
+          <div class="form-row">
+            <label>机型</label>
+            <input type="text" class="model-input" placeholder="如 2353" autocomplete="off">
+          </div>
+          <div class="form-row">
+            <label>SKU/产品名</label>
+            <input type="text" class="sku-input" placeholder="如 T2353_雷达盖-售后 / MR_20002003205（支持部分匹配）" autocomplete="off">
+          </div>
+          <div class="form-row form-hint">
+            <span>两项至少填一项。同时填写时以「机型」优先。</span>
+          </div>
+        </div>
+        <div class="result"></div>
+      </div>
+      <footer>
+        <div class="footer-actions">
+          <button class="btn search-btn">搜索</button>
+        </div>
+      </footer>
+    `;
+    panel.querySelector('.close').addEventListener('click', () => panel.remove());
+    document.body.appendChild(panel);
+    initInboundPanel(panel);
+  }
+
+  function initInboundPanel(panel) {
+    const body       = panel.querySelector('.body');
+    const result     = panel.querySelector('.result');
+    const modelInput = panel.querySelector('.model-input');
+    const skuInput   = panel.querySelector('.sku-input');
+    const runBtn     = panel.querySelector('.search-btn');
+
+    result.innerHTML = '<div class="empty">请输入机型或 SKU 后点击「搜索」</div>';
+
+    async function run() {
+      const model = modelInput.value.trim();
+      const sku   = skuInput.value.trim();
+      if (!model && !sku) { flash(body, '请输入机型或 SKU'); return; }
+
+      runBtn.disabled = true;
+      try {
+        result.innerHTML = '<div class="loading">读取订单列表…</div>';
+        const liveQuery = readInboundPageQuery() || {};
+        let orders;
+        try {
+          orders = await fetchAllInboundOrders(liveQuery);
+        } catch (err) {
+          console.error('[BESENDER 物料搜索] 列表失败', err);
+          result.innerHTML = `<div class="error">获取订单列表失败：${escapeHtml(err.message || String(err))}</div>`;
+          return;
+        }
+        const ankerOrders = orders.filter(isAnkerOrder);
+        if (!ankerOrders.length) {
+          result.innerHTML = `<div class="empty">当前筛选条件下共 ${orders.length} 个订单，未筛出 Anker 订单</div>`;
+          return;
+        }
+
+        result.innerHTML = `<div class="progress">查询订单详情 0/${ankerOrders.length}…</div>`;
+        const matches = [];
+        const failed  = [];
+        let processed = 0;
+        const CONCURRENCY = 5;
+        const queue = ankerOrders.slice();
+        const fetchOne = async (ord) => {
+          try {
+            const resp = await apiGet(API.inboundDetail, { id: ord.id });
+            if (resp && resp.code && resp.code !== 200) {
+              failed.push({ ord, reason: resp.cn_message || resp.message || ('code ' + resp.code) });
+              return;
+            }
+            const detail = (resp && resp.data) || resp || {};
+            const items  = extractInboundItems(detail);
+            for (const it of items) {
+              const matched = model ? itemMatchesModel(it, model)
+                                    : itemMatchesSku(it, sku);
+              if (matched) matches.push({ order: ord, item: it });
+            }
+          } catch (err) {
+            console.error('[BESENDER 物料搜索] 详情失败', ord.order_no, err);
+            failed.push({ ord, reason: err.message || String(err) });
+          } finally {
+            processed++;
+            const prog = result.querySelector('.progress');
+            if (prog) prog.textContent = `查询订单详情 ${processed}/${ankerOrders.length}…`;
+          }
+        };
+        const workers = [];
+        for (let i = 0; i < CONCURRENCY; i++) {
+          workers.push((async function worker() {
+            while (queue.length) {
+              const ord = queue.shift();
+              await fetchOne(ord);
+            }
+          })());
+        }
+        await Promise.all(workers);
+        renderInboundMatches(result, matches, {
+          model, sku,
+          totalOrders: ankerOrders.length,
+          failedCount: failed.length,
+        });
+      } finally {
+        runBtn.disabled = false;
+      }
+    }
+
+    runBtn.addEventListener('click', run);
+    [modelInput, skuInput].forEach(el => el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); run(); }
+    }));
+  }
+
+  // Mirror the page's own list filters (date range, status, keyword …) so the
+  // search runs against the same set of orders the user is currently viewing.
+  function readInboundPageQuery() {
+    const comp = findVueComponent(c => {
+      if (!c || !c.query || typeof c.query !== 'object') return false;
+      // Strong: a fetch method that references the inbound list endpoint.
+      for (const m of ['getData', 'getList', 'getOrderList', 'getTableData', 'init']) {
+        if (typeof c[m] === 'function' && /inboundOrderList/.test(String(c[m]))) {
+          return true;
+        }
+      }
+      // Fallback: rendered rows look like inbound orders.
+      const rows = c.Data && c.Data.data;
+      if (Array.isArray(rows) && rows.length) {
+        const r0 = rows[0] || {};
+        if ('order_no' in r0 && /^IB/.test(String(r0.order_no || ''))) return true;
+        if ('done_boxes' in r0 || 'total_boxes' in r0 || 'express_no' in r0) return true;
+      }
+      return false;
+    });
+    if (!comp) return null;
+    const out = {};
+    for (const k of Object.keys(comp.query)) {
+      const v = comp.query[k];
+      if (v === undefined || v === null || v === '') continue;
+      if (Array.isArray(v))           out[k] = v.slice();
+      else if (typeof v === 'object') continue;
+      else                            out[k] = v;
+    }
+    return out;
+  }
+
+  async function fetchAllInboundOrders(baseQuery) {
+    const params = Object.assign({}, baseQuery || {});
+    flattenParams(params);
+    delete params.page; delete params.limit;
+    const PAGE_SIZE = 200;
+    const first = await apiGet(API.inboundList, Object.assign({}, params, { page: 1, limit: PAGE_SIZE }));
+    if (first && first.code && first.code !== 200) {
+      throw new Error(first.cn_message || first.message || ('code ' + first.code));
+    }
+    let rows = (first && first.data) || [];
+    const total = Number(first && first.meta && first.meta.total) || rows.length;
+    const pages = Math.ceil(total / PAGE_SIZE);
+    if (pages > 1) {
+      const tasks = [];
+      for (let p = 2; p <= pages; p++) {
+        tasks.push(apiGet(API.inboundList, Object.assign({}, params, { page: p, limit: PAGE_SIZE })));
+      }
+      const more = await Promise.all(tasks);
+      more.forEach(r => {
+        if (r && r.code && r.code !== 200) {
+          console.warn('[BESENDER 物料搜索] 分页拉取失败', r);
+          return;
+        }
+        if (r && r.data) rows = rows.concat(r.data);
+      });
+    }
+    return rows;
+  }
+
+  function isAnkerOrder(o) {
+    const company =
+      (o && o.user_info && o.user_info.company) ||
+      o.company ||
+      o.company_name ||
+      '';
+    return /anker/i.test(String(company));
+  }
+
+  // The detail response nests items inside packages / boxes (shape varies).
+  // Walk the tree and collect any object that has both a `sku` and looks
+  // item-shaped (has a quantity field or sku_info / sku_name companion).
+  function extractInboundItems(detail) {
+    const out  = [];
+    const seen = new WeakSet();
+    function walk(node) {
+      if (!node || typeof node !== 'object' || seen.has(node)) return;
+      seen.add(node);
+      if (Array.isArray(node)) { node.forEach(walk); return; }
+      const hasSku  = 'sku' in node && node.sku != null && node.sku !== '';
+      const hasMeta = node.sku_info || node.sku_name || node.cn_sku_name || node.en_sku_name
+                     || 'quantity' in node || 'request_num' in node
+                     || 'confirm_num' in node || 'receive_quantity' in node;
+      if (hasSku && hasMeta) out.push(node);
+      for (const k of Object.keys(node)) {
+        const v = node[k];
+        if (v && typeof v === 'object') walk(v);
+      }
+    }
+    walk(detail);
+    return out;
+  }
+
+  function productNameOf(item) {
+    const info = item.sku_info || {};
+    return info.cn_sku_name || info.en_sku_name
+        || item.sku_name || item.product_name || item.cn_sku_name || item.en_sku_name || '';
+  }
+
+  // Match by 4-digit machine model code embedded in the product name or SKU.
+  // The convention in this catalog is `T<model>` (e.g. T2353_雷达盖-售后).
+  // Special case requested by user: 2353 also matches 2352 物料.
+  function itemMatchesModel(item, model) {
+    const hay = (productNameOf(item) + ' ' + (item.sku || '')).toLowerCase();
+    const m = String(model).trim();
+    if (!m) return false;
+    const patterns = m === '2353' ? ['2353', '2352'] : [m];
+    return patterns.some(p => hay.includes('t' + p));
+  }
+
+  function itemMatchesSku(item, query) {
+    const q = String(query).trim().toLowerCase();
+    if (!q) return false;
+    const sku  = String(item.sku || '').toLowerCase();
+    const name = productNameOf(item).toLowerCase();
+    return sku.includes(q) || name.includes(q);
+  }
+
+  function quantityRequest(item) {
+    const v = item.request_num != null ? item.request_num
+            : item.quantity    != null ? item.quantity
+            : 0;
+    return Number(v) || 0;
+  }
+  function quantityConfirm(item) {
+    const v = item.confirm_num      != null ? item.confirm_num
+            : item.receive_quantity != null ? item.receive_quantity
+            : 0;
+    return Number(v) || 0;
+  }
+
+  function renderInboundMatches(container, matches, ctx) {
+    const { model, sku, totalOrders, failedCount } = ctx;
+    const queryLabel = model
+      ? `机型 <b>${escapeHtml(model)}</b>${model === '2353' ? '（含 2352）' : ''}`
+      : `SKU/产品名 <b>${escapeHtml(sku)}</b>`;
+
+    if (!matches.length) {
+      container.innerHTML = `
+        <div class="hint">${queryLabel}：在 ${totalOrders} 个 Anker 订单中未找到匹配物料。</div>
+        ${failedCount ? `<div class="error" style="margin-top:8px">${failedCount} 个订单查询失败（详见 console）</div>` : ''}
+      `;
+      return;
+    }
+
+    // Aggregate by SKU.
+    const bySku = new Map();
+    for (const { order, item } of matches) {
+      const key = item.sku || productNameOf(item) || 'unknown';
+      let e = bySku.get(key);
+      if (!e) {
+        e = { sku: item.sku || '', name: productNameOf(item),
+              req: 0, conf: 0, orders: new Set(), orderNos: [] };
+        bySku.set(key, e);
+      }
+      e.req  += quantityRequest(item);
+      e.conf += quantityConfirm(item);
+      const tag = order.order_no || order.id;
+      if (!e.orders.has(tag)) { e.orders.add(tag); e.orderNos.push(tag); }
+    }
+    const rows  = Array.from(bySku.values()).sort((a, b) => b.req - a.req);
+    const total = { req: 0, conf: 0, orders: new Set() };
+    rows.forEach(r => {
+      total.req  += r.req;
+      total.conf += r.conf;
+      r.orders.forEach(o => total.orders.add(o));
+    });
+
+    container.innerHTML = `
+      <div class="hint">${queryLabel}：在 ${totalOrders} 个 Anker 订单中，命中 ${total.orders.size} 个订单 / ${rows.length} 个 SKU</div>
+      <table class="summary">
+        <thead>
+          <tr><th>SKU</th><th>产品名称</th><th>申请总数</th><th>确认总数</th><th>订单数</th></tr>
+        </thead>
+        <tbody>
+          ${rows.map(r => `
+            <tr>
+              <td>${escapeHtml(r.sku)}</td>
+              <td title="${escapeHtml(r.name)}">${escapeHtml(r.name)}</td>
+              <td class="good">${r.req}</td>
+              <td>${r.conf}</td>
+              <td title="${escapeHtml(r.orderNos.join(', '))}">${r.orders.size}</td>
+            </tr>
+          `).join('')}
+          <tr class="total">
+            <td colspan="2">合计 (${rows.length} 个 SKU)</td>
+            <td class="good">${total.req}</td>
+            <td>${total.conf}</td>
+            <td>${total.orders.size}</td>
+          </tr>
+        </tbody>
+      </table>
+      ${failedCount ? `<div class="error" style="margin-top:8px">${failedCount} 个订单查询失败（详见 console）</div>` : ''}
+    `;
+  }
+
   // ── Page-2 timestamp decoration (China time → local + hover tooltip) ────
 
   function decorateTimestamps(scope) {
@@ -969,7 +1330,7 @@
 
   function isAggregablePage() {
     const k = pageKind();
-    return k === 'list' || k === 'detail';
+    return k === 'list' || k === 'detail' || k === 'inbound';
   }
 
   function boot() {
@@ -978,6 +1339,11 @@
       ensureFab();
       attachTimeTooltip();
       watchForTimestamps();
+      // Close a stale panel if the user moved between page kinds (e.g. retread → inbound).
+      const open = document.getElementById(PANEL_ID);
+      if (open && open.dataset.panelKind && open.dataset.panelKind !== pageKind()) {
+        open.remove();
+      }
     } else {
       // Remove FAB if user navigated away inside the SPA.
       const f = document.getElementById(FAB_ID); if (f) f.remove();
