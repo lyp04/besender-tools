@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.5.2
+// @version      1.5.3
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
@@ -29,7 +29,8 @@
 
   // Page-2 row `status` field (workflow):
   //   1 待审核 / 2 可用 / 3 作废 / 4 待确认 / 5 已审核
-  // Rows with status === 3 are voided and count toward 报废 (scrap), not 良品/不良品.
+  // Rows with status === 3 are admin-voided data entries (data-entry retractions)
+  // and are excluded from the totals — they aren't a production outcome.
   const STATUS_VOID = 3;
   // 良品/不良品 classification doesn't use any top-level `result` field — it
   // walks the row for any value shaped like {sku, name, num} (template-defined
@@ -240,7 +241,6 @@
       #${PANEL_ID} table.summary tr.err-row td { background: #fff7ed; }
       #${PANEL_ID} table.summary td.good  { color: #19be6b; font-weight: 600; }
       #${PANEL_ID} table.summary td.bad   { color: #ed4014; font-weight: 600; }
-      #${PANEL_ID} table.summary td.scrap { color: #ff9900; font-weight: 600; }
       #${PANEL_ID} table.summary td.rate  { color: #515a6e; font-weight: 600; text-align: right; }
       #${PANEL_ID} .err-tag { color: #ed4014; cursor: help; margin-left: 4px; }
 
@@ -585,7 +585,7 @@
     const result = panel.querySelector('.result') || panel.querySelector('.body');
     result.innerHTML = `<div class="loading">查询 ${models.length} 个型号 (${escapeHtml(label)}) …</div>`;
 
-    const totals = { good: 0, bad: 0, scrap: 0, all: 0 };
+    const totals = { good: 0, bad: 0, all: 0 };
     const rows = [];
     for (const m of models) {
       try {
@@ -599,20 +599,19 @@
         // errors are e.g. {code: 30006, message: "...", cn_message: "..."} with
         // no `data`. Anything with code != 200 is a failure for that row only.
         if (resp && resp.code && resp.code !== 200) {
-          rows.push({ model: m, good: 0, bad: 0, scrap: 0, all: 0,
+          rows.push({ model: m, good: 0, bad: 0, all: 0,
                       error: resp.cn_message || resp.message || ('code ' + resp.code) });
           continue;
         }
         const data = (resp && resp.data) || [];
         const c = classify(data);
         rows.push({ model: m, ...c });
-        totals.good  += c.good;
-        totals.bad   += c.bad;
-        totals.scrap += c.scrap;
-        totals.all   += c.all;
+        totals.good += c.good;
+        totals.bad  += c.bad;
+        totals.all  += c.all;
       } catch (err) {
         console.error('[BESENDER 聚合] 查询失败', m, err);
-        rows.push({ model: m, good: 0, bad: 0, scrap: 0, all: 0, error: err.message || String(err) });
+        rows.push({ model: m, good: 0, bad: 0, all: 0, error: err.message || String(err) });
       }
     }
 
@@ -639,13 +638,15 @@
   }
 
   function classify(rows) {
-    let good = 0, bad = 0, scrap = 0;
+    // 不良品 IS the scrap output in the user's mental model. Workflow-voided
+    // entries (status === 3) are data-entry retractions / admin noise — excluded
+    // from production totals entirely.
+    let good = 0, bad = 0;
     for (const r of rows) {
-      if (r.status === STATUS_VOID) { scrap++; continue; }
+      if (r.status === STATUS_VOID) continue;
       if (isDefective(r)) bad++; else good++;
     }
-    const all = good + bad + scrap;
-    return { good, bad, scrap, all };
+    return { good, bad, all: good + bad };
   }
 
   function fmtRate(n, d) {
@@ -683,11 +684,10 @@
         <thead>
           <tr>
             <th>SKU</th><th>型号</th>
-            <th title="良品数（翻新结果非 Defective、未作废）">良品</th>
-            <th title="不良品数（翻新结果 = Defective、未作废）">不良品</th>
-            <th title="报废数（状态 = 作废）">报废</th>
-            <th title="良品 + 不良品 + 报废">总和</th>
-            <th title="报废 / 总和">报废率</th>
+            <th title="翻新结果可用，非 Defective">良品</th>
+            <th title="翻新结果为 Defective item — 即报废件">不良品</th>
+            <th title="良品 + 不良品（不含工作流作废的录入）">总和</th>
+            <th title="不良品 / 总和">报废率</th>
           </tr>
         </thead>
         <tbody>
@@ -697,18 +697,16 @@
               <td title="${escapeHtml(r.model.productName || '')}">${escapeHtml(r.model.model || r.model.productName || r.model.sku)}</td>
               <td class="good">${r.good}</td>
               <td class="bad">${r.bad}</td>
-              <td class="scrap">${r.scrap}</td>
               <td>${r.all}${r.error ? ' <span class="err-tag" title="' + escapeHtml(r.error) + '">⚠</span>' : ''}</td>
-              <td class="rate">${fmtRate(r.scrap, r.all)}</td>
+              <td class="rate">${fmtRate(r.bad, r.all)}</td>
             </tr>
           `).join('')}
           <tr class="total">
             <td colspan="2">合计 (${hiddenCount > 0 ? `${visibleRows.length} 有产出 / 共 ${rows.length}` : `${visibleRows.length} 个型号`})</td>
             <td class="good">${totals.good}</td>
             <td class="bad">${totals.bad}</td>
-            <td class="scrap">${totals.scrap}</td>
             <td>${totals.all}</td>
-            <td class="rate">${fmtRate(totals.scrap, totals.all)}</td>
+            <td class="rate">${fmtRate(totals.bad, totals.all)}</td>
           </tr>
         </tbody>
       </table>
