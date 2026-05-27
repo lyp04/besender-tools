@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.7.1
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+机型/SKU 反查在途/入库中订单的物料。中国时间自动换算为本地时区，悬停显示原始中国时间。
+// @version      1.7.2
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -181,6 +181,17 @@
     const tz = localTZ();
     const now = new Date();
     return fmtInTZ(now, tz).slice(0, 10);
+  }
+
+  // Shift a local-calendar date "YYYY-MM-DD" by `days` and return the new
+  // local-calendar date string, in the user's active timezone.
+  function localDateOffset(localDateStr, days) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(localDateStr || '').trim());
+    if (!m) return localDateStr;
+    const tz   = localTZ();
+    const utc  = localWallToUTC(+m[1], +m[2], +m[3], 0, 0, 0, tz);
+    const next = new Date(utc.getTime() + days * 24 * 3600 * 1000);
+    return fmtInTZ(next, tz).slice(0, 10);
   }
 
   // ── Styles ──────────────────────────────────────────────────────────────
@@ -863,6 +874,8 @@
   // ── Inbound page (头程入库) material/model lookup ───────────────────────
 
   function openInboundPanel() {
+    const today  = localTodayStr();
+    const inOneWeek = localDateOffset(today, 7);
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
     panel.dataset.panelKind = 'inbound';
@@ -882,6 +895,13 @@
             <select class="company-select">${buildCompanyOptionsHtml()}</select>
           </div>
           <div class="form-row">
+            <label>预计到达</label>
+            <input type="date" class="eta-start" value="${today}">
+            <span style="color:#888">~</span>
+            <input type="date" class="eta-end"   value="${inOneWeek}">
+            <button type="button" class="btn ghost eta-clear" style="padding:4px 8px;font-size:12px">不限</button>
+          </div>
+          <div class="form-row">
             <label>机型</label>
             <input type="text" class="model-input" placeholder="如 2353" autocomplete="off">
           </div>
@@ -890,7 +910,7 @@
             <input type="text" class="sku-input" placeholder="如 T2353_雷达盖-售后 / MR_20002003205（支持部分匹配）" autocomplete="off">
           </div>
           <div class="form-row form-hint">
-            <span>机型与 SKU 两项至少填一项。同时填写时以「机型」优先。</span>
+            <span>机型与 SKU 两项至少填一项。预计到达默认<b>一周内</b>；订单无「预计入库时间」时按「创建时间 + 40 天」估算。「不限」清空时间窗口。</span>
           </div>
         </div>
         <div class="result"></div>
@@ -902,6 +922,10 @@
       </footer>
     `;
     panel.querySelector('.close').addEventListener('click', () => panel.remove());
+    panel.querySelector('.eta-clear').addEventListener('click', () => {
+      panel.querySelector('.eta-start').value = '';
+      panel.querySelector('.eta-end').value   = '';
+    });
     document.body.appendChild(panel);
     initInboundPanel(panel);
   }
@@ -938,6 +962,8 @@
     const body          = panel.querySelector('.body');
     const result        = panel.querySelector('.result');
     const companySelect = panel.querySelector('.company-select');
+    const etaStartInput = panel.querySelector('.eta-start');
+    const etaEndInput   = panel.querySelector('.eta-end');
     const modelInput    = panel.querySelector('.model-input');
     const skuInput      = panel.querySelector('.sku-input');
     const runBtn        = panel.querySelector('.search-btn');
@@ -952,31 +978,58 @@
       const companyId    = companySelect.value;
       const companyLabel =
         (companySelect.options[companySelect.selectedIndex] || {}).textContent || '所选公司';
+      const etaStart = etaStartInput.value || '';
+      const etaEnd   = etaEndInput.value   || '';
+      const { startMs, endMs } = etaWindow(etaStart, etaEnd);
+      const etaActive = startMs != null || endMs != null;
 
       runBtn.disabled = true;
       try {
         result.innerHTML = '<div class="loading">读取订单列表…</div>';
-        // Mirror the page's own list filters (date range, keyword, …) and
-        // then force the two filters this feature requires:
+        // Mirror the page's own list filters (keyword, …) and then force the
+        // two filters this feature requires:
         //   - user_id: the selected company
         //   - status:  in-transit (2) + in-storage (3); finished/cancelled
         //              orders carry no live inventory so we exclude them.
         // The API rejects array `status` (returns 500) — must be CSV string.
+        // ETA filtering is done client-side (the API has no expect_in_time
+        // filter, and we need the +40d fallback for orders without ETA).
         const liveQuery = readInboundPageQuery() || {};
         if (companyId) liveQuery.user_id = Number(companyId);
         else           delete liveQuery.user_id;
         liveQuery.status = '2,3';
+        // Drop any page-mirrored date filter — our ETA filter replaces it.
+        delete liveQuery.start; delete liveQuery.end; delete liveQuery.time_type;
 
-        let orders;
+        let allOrders;
         try {
-          orders = await fetchAllInboundOrders(liveQuery);
+          allOrders = await fetchAllInboundOrders(liveQuery);
         } catch (err) {
           console.error('[BESENDER 物料搜索] 列表失败', err);
           result.innerHTML = `<div class="error">获取订单列表失败：${escapeHtml(err.message || String(err))}</div>`;
           return;
         }
+        if (!allOrders.length) {
+          result.innerHTML = `<div class="empty">${escapeHtml(companyLabel)} 名下没有在途/入库中订单</div>`;
+          return;
+        }
+
+        // Apply ETA window filter (if any).
+        let orders = allOrders;
+        if (etaActive) {
+          orders = allOrders.filter(o => {
+            const ts = expectedArrivalTs(o);
+            if (ts == null) return false;
+            if (startMs != null && ts < startMs) return false;
+            if (endMs   != null && ts > endMs)   return false;
+            return true;
+          });
+        }
         if (!orders.length) {
-          result.innerHTML = `<div class="empty">${escapeHtml(companyLabel)} 名下没有头程入库订单</div>`;
+          const windowLabel = etaActive
+            ? `预计到达 ${escapeHtml(etaStart || '不限')} ~ ${escapeHtml(etaEnd || '不限')}`
+            : '当前条件';
+          result.innerHTML = `<div class="empty">${escapeHtml(companyLabel)} 共 ${allOrders.length} 个在途/入库中订单，${windowLabel} 内为 0 单</div>`;
           return;
         }
 
@@ -1023,6 +1076,8 @@
           model, sku,
           company:     companyLabel,
           totalOrders: orders.length,
+          totalBefore: allOrders.length,
+          etaActive,  etaStart, etaEnd,
           failedCount: failed.length,
         });
       } finally {
@@ -1097,6 +1152,45 @@
     return rows;
   }
 
+  // Expected arrival time for an inbound order, in milliseconds since epoch.
+  // Priority: explicit expect_in_time (date-only string like "2026-04-15", or a
+  // full datetime) — fallback to created_at + 40 days when the user hasn't set
+  // one. Returns null if neither field is parseable (such orders won't pass
+  // any ETA window filter).
+  const ETA_FALLBACK_DAYS = 40;
+  function expectedArrivalTs(order) {
+    const raw = order && order.expect_in_time;
+    if (raw) {
+      const s = String(raw).trim();
+      const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s);
+      const norm = dateOnly ? `${dateOnly[1]}-${dateOnly[2]}-${dateOnly[3]} 12:00:00` : s;
+      const t = parseServerTime(norm);
+      if (t) return t.getTime();
+    }
+    if (order && order.created_at) {
+      const c = parseServerTime(order.created_at);
+      if (c) return c.getTime() + ETA_FALLBACK_DAYS * 24 * 3600 * 1000;
+    }
+    return null;
+  }
+
+  // Build a [startMs, endMs] window from two local-calendar dates ("YYYY-MM-DD"),
+  // interpreted as [start 00:00:00, end 23:59:59] in the user's active TZ.
+  // Either side may be empty — that side becomes unbounded.
+  function etaWindow(startStr, endStr) {
+    const tz = localTZ();
+    let startMs = null, endMs = null;
+    if (startStr) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(startStr);
+      if (m) startMs = localWallToUTC(+m[1], +m[2], +m[3], 0, 0, 0, tz).getTime();
+    }
+    if (endStr) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(endStr);
+      if (m) endMs = localWallToUTC(+m[1], +m[2], +m[3], 23, 59, 59, tz).getTime();
+    }
+    return { startMs, endMs };
+  }
+
   // The detail response nests items inside packages[].items[]; each item also
   // carries a nested `sku_info` that mirrors `sku`/`sku_name` (for the product
   // catalog row). A naive walker would collect both — leading to double counts.
@@ -1165,15 +1259,22 @@
   }
 
   function renderInboundMatches(container, matches, ctx) {
-    const { model, sku, company, totalOrders, failedCount } = ctx;
+    const { model, sku, company, totalOrders, totalBefore,
+            etaActive, etaStart, etaEnd, failedCount } = ctx;
     const queryLabel = model
       ? `机型 <b>${escapeHtml(model)}</b>${model === '2353' ? '（含 2352）' : ''}`
       : `SKU/产品名 <b>${escapeHtml(sku)}</b>`;
     const companyTag = company ? `<b>${escapeHtml(company)}</b>` : '所选公司';
+    const etaTag = etaActive
+      ? `预计到达 <b>${escapeHtml(etaStart || '不限')} ~ ${escapeHtml(etaEnd || '不限')}</b>`
+      : `预计到达 <b>不限</b>`;
+    const scopeTag = etaActive && totalBefore !== totalOrders
+      ? `${totalOrders} 单（${etaTag}，从 ${totalBefore} 单筛得）`
+      : `${totalOrders} 个在途/入库中订单（${etaTag}）`;
 
     if (!matches.length) {
       container.innerHTML = `
-        <div class="hint">${queryLabel}：在 ${companyTag} 的 ${totalOrders} 个在途/入库中订单中未找到匹配物料。</div>
+        <div class="hint">${queryLabel}：在 ${companyTag} 的 ${scopeTag} 中未找到匹配物料。</div>
         ${failedCount ? `<div class="error" style="margin-top:8px">${failedCount} 个订单查询失败（详见 console）</div>` : ''}
       `;
       return;
@@ -1203,7 +1304,7 @@
     });
 
     container.innerHTML = `
-      <div class="hint">${queryLabel}：在 ${companyTag} 的 ${totalOrders} 个在途/入库中订单中，命中 ${total.orders.size} 个订单 / ${rows.length} 个 SKU</div>
+      <div class="hint">${queryLabel}：在 ${companyTag} 的 ${scopeTag} 中，命中 ${total.orders.size} 个订单 / ${rows.length} 个 SKU</div>
       <table class="summary">
         <thead>
           <tr><th>SKU</th><th>产品名称</th><th>申请总数</th><th>确认总数</th><th>订单数</th></tr>
