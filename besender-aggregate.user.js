@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.5.0
+// @version      1.5.1
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
@@ -27,14 +27,13 @@
 
   const SERVER_TZ = 'Asia/Shanghai';  // server stores timestamps in this timezone
 
-  // Page-2 row `result` field:
-  //   1 = 不良品 (defective)   2 = 良品 (good)
-  const RESULT_DEFECTIVE = 1;
-  const RESULT_GOOD      = 2;
-
   // Page-2 row `status` field (workflow):
   //   1 待审核 / 2 可用 / 3 作废 / 4 待确认 / 5 已审核
-  const STATUS_VOID = 3;  // we'll exclude these from totals — see options
+  // Rows with status === 3 are voided and count toward 报废 (scrap), not 良品/不良品.
+  const STATUS_VOID = 3;
+  // 良品/不良品 classification doesn't use any top-level `result` field — it
+  // walks the row for any value shaped like {sku, name, num} (template-defined
+  // dynamic key) and decides by whether sku is empty. See isDefective().
 
   // Endpoint paths (under the same origin)
   const API = {
@@ -485,6 +484,10 @@
       // Paginate through results when the filtered total exceeds one page.
       const PAGE_SIZE = 200;
       const first = await apiGet(API.manageList, Object.assign({}, baseParams, { page: 1, limit: PAGE_SIZE }));
+      if (first && first.code && first.code !== 200) {
+        body.innerHTML = `<div class="error">获取型号列表失败：${escapeHtml(first.cn_message || first.message || ('code ' + first.code))}</div>`;
+        return;
+      }
       let rows = (first && first.data) || [];
       const total = Number(first && first.meta && first.meta.total) || rows.length;
       const pages = Math.ceil(total / PAGE_SIZE);
@@ -494,7 +497,13 @@
           tasks.push(apiGet(API.manageList, Object.assign({}, baseParams, { page: p, limit: PAGE_SIZE })));
         }
         const more = await Promise.all(tasks);
-        more.forEach(r => { if (r && r.data) rows = rows.concat(r.data); });
+        more.forEach(r => {
+          if (r && r.code && r.code !== 200) {
+            console.warn('[BESENDER 聚合] 分页拉取失败', r);
+            return;
+          }
+          if (r && r.data) rows = rows.concat(r.data);
+        });
       }
       models = rows.map(r => {
         const p = r.product_info || {};
@@ -584,9 +593,10 @@
           start:        chinaStart,
           end:          chinaEnd,
         });
-        // The API may return an error wrapper {code, message, ...} with no `data` —
-        // treat that as a per-row failure surfaced to the user, not a hard throw.
-        if (resp && resp.code) {
+        // Success responses are {code: 200, message: "Success", data: [...]};
+        // errors are e.g. {code: 30006, message: "...", cn_message: "..."} with
+        // no `data`. Anything with code != 200 is a failure for that row only.
+        if (resp && resp.code && resp.code !== 200) {
           rows.push({ model: m, good: 0, bad: 0, scrap: 0, all: 0,
                       error: resp.cn_message || resp.message || ('code ' + resp.code) });
           continue;
@@ -716,7 +726,7 @@
           start: range.chinaStart,
           end:   range.chinaEnd,
         });
-        if (resp && resp.code) {
+        if (resp && resp.code && resp.code !== 200) {
           body.innerHTML = `<div class="error">${escapeHtml(resp.cn_message || resp.message || ('code ' + resp.code))}</div>`;
           return;
         }
