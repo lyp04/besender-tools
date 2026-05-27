@@ -1,15 +1,14 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.1.0
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当天统计。系统显示的中国时间会自动换算为本地时区，鼠标悬停可查看原始中国时间。
+// @version      1.2.0
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
 // @grant        none
-// @updateURL    https://__GH_PAT__@raw.githubusercontent.com/lyp04/besender-tools/main/besender-aggregate.user.js
-// @downloadURL  https://__GH_PAT__@raw.githubusercontent.com/lyp04/besender-tools/main/besender-aggregate.user.js
 // ==/UserScript==
+// Note: this file also serves as the Chrome extension content script — see manifest.json.
 
 // Co-authored by Claude (Anthropic) — AI-assisted development
 
@@ -187,9 +186,26 @@
       #${PANEL_ID} .body::-webkit-scrollbar-thumb { background: #ddd; border-radius: 3px; }
 
       #${PANEL_ID} footer {
-        display: flex; align-items: center; gap: 8px;
+        display: flex; flex-direction: column; align-items: stretch; gap: 10px;
         padding: 10px 14px; border-top: 1px solid #eee; background: #fafafa;
-        flex-wrap: wrap;
+      }
+      #${PANEL_ID} .date-controls {
+        display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      }
+      #${PANEL_ID} .date-fields {
+        display: flex; align-items: center; gap: 6px;
+      }
+      #${PANEL_ID} .mode-tabs {
+        display: inline-flex; border: 1px solid #d0d4dc; border-radius: 4px; overflow: hidden;
+      }
+      #${PANEL_ID} .mode-tab {
+        padding: 4px 10px; font-size: 12px; color: #666; background: #fff;
+        border: none; cursor: pointer; outline: none;
+      }
+      #${PANEL_ID} .mode-tab + .mode-tab { border-left: 1px solid #d0d4dc; }
+      #${PANEL_ID} .mode-tab.active { background: #2d8cf0; color: #fff; }
+      #${PANEL_ID} .footer-actions {
+        display: flex; align-items: center; gap: 8px; justify-content: flex-end;
       }
       #${PANEL_ID} footer label.date-label { font-size: 12px; color: #666; }
       #${PANEL_ID} input[type="date"] {
@@ -203,8 +219,6 @@
       }
       #${PANEL_ID} .btn.ghost { background: #fff; color: #2d8cf0; }
       #${PANEL_ID} .btn:disabled { opacity: 0.5; cursor: not-allowed; }
-      #${PANEL_ID} .btn + .btn { margin-left: 0; }
-      #${PANEL_ID} .spacer { flex: 1; }
 
       #${PANEL_ID} .model-row {
         display: flex; align-items: center; gap: 8px;
@@ -371,23 +385,52 @@
 
   function openPanel() {
     const kind = pageKind();
+    const today = localTodayStr();
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
     panel.innerHTML = `
       <header>
-        <span class="title">${kind === 'list' ? '勾选型号汇总' : (kind === 'detail' ? '当前型号当天统计' : 'BESENDER 聚合')}</span>
+        <span class="title">${kind === 'list' ? '勾选型号汇总' : (kind === 'detail' ? '当前型号统计' : 'BESENDER 聚合')}</span>
         <span class="close" title="关闭">✕</span>
       </header>
       <div class="body"><div class="loading">加载中…</div></div>
       <footer>
-        <label class="date-label">本地日期</label>
-        <input type="date" class="date-input" value="${localTodayStr()}">
-        <span class="spacer"></span>
-        ${kind === 'list' ? '<button class="btn ghost select-all">全选</button>' : ''}
-        <button class="btn run">查询</button>
+        <div class="date-controls">
+          <div class="mode-tabs" role="tablist">
+            <button class="mode-tab active" data-mode="single" role="tab">单日</button>
+            <button class="mode-tab"        data-mode="range"  role="tab">区间</button>
+          </div>
+          <div class="date-fields single">
+            <label class="date-label">本地日期</label>
+            <input type="date" class="date-input" value="${today}">
+          </div>
+          <div class="date-fields range" style="display:none">
+            <label class="date-label">从</label>
+            <input type="date" class="date-start" value="${today}">
+            <label class="date-label">到</label>
+            <input type="date" class="date-end"   value="${today}">
+          </div>
+        </div>
+        <div class="footer-actions">
+          ${kind === 'list' ? '<button class="btn ghost select-all">全选</button>' : ''}
+          <button class="btn run">查询</button>
+        </div>
       </footer>
     `;
     panel.querySelector('.close').addEventListener('click', () => panel.remove());
+
+    // Wire mode tabs
+    const tabs   = panel.querySelectorAll('.mode-tab');
+    const single = panel.querySelector('.date-fields.single');
+    const range  = panel.querySelector('.date-fields.range');
+    tabs.forEach(t => t.addEventListener('click', () => {
+      tabs.forEach(x => x.classList.toggle('active', x === t));
+      const m = t.dataset.mode;
+      single.style.display = m === 'single' ? '' : 'none';
+      range .style.display = m === 'range'  ? '' : 'none';
+      panel.dataset.dateMode = m;
+    }));
+    panel.dataset.dateMode = 'single';
 
     document.body.appendChild(panel);
 
@@ -398,6 +441,26 @@
         '<div class="empty">请在「翻新数据管理」(refurbish) 列表页 或 详情页 (retreadDetail) 使用本插件。</div>';
       panel.querySelector('.run').disabled = true;
     }
+  }
+
+  // Read the current date selection out of the panel. Returns {label, chinaStart, chinaEnd}
+  // where chinaStart/chinaEnd are server-time strings ("YYYY-MM-DD HH:mm:ss").
+  function readPanelDateRange(panel) {
+    const mode = panel.dataset.dateMode || 'single';
+    if (mode === 'single') {
+      const d = panel.querySelector('.date-input').value || localTodayStr();
+      const r = localDateToChinaRange(d);
+      return r ? { label: d, chinaStart: r[0], chinaEnd: r[1] } : null;
+    }
+    const a = panel.querySelector('.date-start').value;
+    const b = panel.querySelector('.date-end').value;
+    if (!a || !b) return null;
+    const [start] = a <= b ? [a] : [b];
+    const [end]   = a <= b ? [b] : [a];
+    const r1 = localDateToChinaRange(start);
+    const r2 = localDateToChinaRange(end);
+    if (!r1 || !r2) return null;
+    return { label: `${start} ~ ${end}`, chinaStart: r1[0], chinaEnd: r2[1] };
   }
 
   // ── List page (page 1) panel ────────────────────────────────────────────
@@ -481,13 +544,12 @@
         flash(body, '请至少勾选一个型号');
         return;
       }
-      const localDate = dateI.value || localTodayStr();
-      const range = localDateToChinaRange(localDate);
+      const range = readPanelDateRange(panel);
       if (!range) {
         flash(body, '日期格式错误');
         return;
       }
-      await runAggregate(panel, chosen, localDate, range);
+      await runAggregate(panel, chosen, range);
     });
   }
 
@@ -502,9 +564,10 @@
     setTimeout(() => { if (bar) bar.remove(); }, 2400);
   }
 
-  async function runAggregate(panel, models, localDate, [chinaStart, chinaEnd]) {
+  async function runAggregate(panel, models, range) {
+    const { label, chinaStart, chinaEnd } = range;
     const result = panel.querySelector('.result') || panel.querySelector('.body');
-    result.innerHTML = `<div class="loading">查询 ${models.length} 个型号 (${localDate}) …</div>`;
+    result.innerHTML = `<div class="loading">查询 ${models.length} 个型号 (${escapeHtml(label)}) …</div>`;
 
     let totalGood = 0, totalBad = 0, totalAll = 0;
     const rows = [];
@@ -528,7 +591,7 @@
       }
     }
 
-    renderSummary(result, rows, localDate, chinaStart, chinaEnd, totalGood, totalBad, totalAll);
+    renderSummary(result, rows, label, chinaStart, chinaEnd, totalGood, totalBad, totalAll);
   }
 
   // A row is 不良品 iff its 翻新结果 field — a template-defined dynamic key
@@ -560,11 +623,11 @@
     return { good, bad, all };
   }
 
-  function renderSummary(container, rows, localDate, chinaStart, chinaEnd, totalGood, totalBad, totalAll) {
+  function renderSummary(container, rows, label, chinaStart, chinaEnd, totalGood, totalBad, totalAll) {
     const tz = localTZ();
     container.innerHTML = `
       <div class="hint">
-        本地日期 <b>${localDate}</b> (${escapeHtml(tz)}) 对应中国时间窗口：
+        本地 <b>${escapeHtml(label)}</b> (${escapeHtml(tz)}) 对应中国时间窗口：
         <b>${escapeHtml(chinaStart)}</b> ~ <b>${escapeHtml(chinaEnd)}</b>
       </div>
       <table class="summary">
@@ -596,7 +659,6 @@
 
   async function initDetailPanel(panel) {
     const body  = panel.querySelector('.body');
-    const dateI = panel.querySelector('.date-input');
     const run   = panel.querySelector('.run');
 
     const params = new URLSearchParams(location.search);
@@ -614,19 +676,18 @@
     const model = { sku, name, model: name, manage_id, warehouse_id, auditable: '' };
 
     async function refresh() {
-      const localDate = dateI.value || localTodayStr();
-      const range = localDateToChinaRange(localDate);
+      const range = readPanelDateRange(panel);
       if (!range) { body.innerHTML = '<div class="error">日期格式错误</div>'; return; }
-      body.innerHTML = `<div class="loading">查询 ${escapeHtml(sku || manage_id)} (${localDate}) …</div>`;
+      body.innerHTML = `<div class="loading">查询 ${escapeHtml(sku || manage_id)} (${escapeHtml(range.label)}) …</div>`;
       try {
         const resp = await apiGet(API.retreadAll, {
           warehouse_id, manage_id,
-          start: range[0],
-          end:   range[1],
+          start: range.chinaStart,
+          end:   range.chinaEnd,
         });
         const data = (resp && resp.data) || [];
         const c = classify(data);
-        renderSummary(body, [{ model, ...c }], localDate, range[0], range[1], c.good, c.bad, c.all);
+        renderSummary(body, [{ model, ...c }], range.label, range.chinaStart, range.chinaEnd, c.good, c.bad, c.all);
       } catch (err) {
         console.error('[BESENDER 聚合] 查询失败', err);
         body.innerHTML = `<div class="error">查询失败：${escapeHtml(err.message || String(err))}</div>`;
@@ -634,7 +695,8 @@
     }
 
     run.addEventListener('click', refresh);
-    dateI.addEventListener('change', refresh);
+    panel.querySelectorAll('.date-input, .date-start, .date-end, .mode-tab')
+      .forEach(el => el.addEventListener('change', refresh));
     refresh();
   }
 
