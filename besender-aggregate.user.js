@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.4.0
+// @version      1.5.0
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
@@ -238,8 +238,12 @@
       }
       #${PANEL_ID} table.summary th { background: #f5f7fa; font-weight: 600; }
       #${PANEL_ID} table.summary tr.total td { background: #fff7e6; font-weight: 700; }
-      #${PANEL_ID} table.summary td.good { color: #19be6b; font-weight: 600; }
-      #${PANEL_ID} table.summary td.bad  { color: #ed4014; font-weight: 600; }
+      #${PANEL_ID} table.summary tr.err-row td { background: #fff7ed; }
+      #${PANEL_ID} table.summary td.good  { color: #19be6b; font-weight: 600; }
+      #${PANEL_ID} table.summary td.bad   { color: #ed4014; font-weight: 600; }
+      #${PANEL_ID} table.summary td.scrap { color: #ff9900; font-weight: 600; }
+      #${PANEL_ID} table.summary td.rate  { color: #515a6e; font-weight: 600; text-align: right; }
+      #${PANEL_ID} .err-tag { color: #ed4014; cursor: help; margin-left: 4px; }
 
       #${PANEL_ID} .empty   { color: #999; padding: 12px; text-align: center; }
       #${PANEL_ID} .loading { color: #2d8cf0; padding: 12px; text-align: center; }
@@ -570,7 +574,7 @@
     const result = panel.querySelector('.result') || panel.querySelector('.body');
     result.innerHTML = `<div class="loading">查询 ${models.length} 个型号 (${escapeHtml(label)}) …</div>`;
 
-    let totalGood = 0, totalBad = 0, totalAll = 0;
+    const totals = { good: 0, bad: 0, scrap: 0, all: 0 };
     const rows = [];
     for (const m of models) {
       try {
@@ -580,19 +584,27 @@
           start:        chinaStart,
           end:          chinaEnd,
         });
+        // The API may return an error wrapper {code, message, ...} with no `data` —
+        // treat that as a per-row failure surfaced to the user, not a hard throw.
+        if (resp && resp.code) {
+          rows.push({ model: m, good: 0, bad: 0, scrap: 0, all: 0,
+                      error: resp.cn_message || resp.message || ('code ' + resp.code) });
+          continue;
+        }
         const data = (resp && resp.data) || [];
         const c = classify(data);
         rows.push({ model: m, ...c });
-        totalGood += c.good;
-        totalBad  += c.bad;
-        totalAll  += c.all;
+        totals.good  += c.good;
+        totals.bad   += c.bad;
+        totals.scrap += c.scrap;
+        totals.all   += c.all;
       } catch (err) {
         console.error('[BESENDER 聚合] 查询失败', m, err);
-        rows.push({ model: m, good: 0, bad: 0, all: 0, error: err.message || String(err) });
+        rows.push({ model: m, good: 0, bad: 0, scrap: 0, all: 0, error: err.message || String(err) });
       }
     }
 
-    renderSummary(result, rows, label, chinaStart, chinaEnd, totalGood, totalBad, totalAll);
+    renderSummary(result, rows, label, chinaStart, chinaEnd, totals);
   }
 
   // A row is 不良品 iff its 翻新结果 field — a template-defined dynamic key
@@ -615,17 +627,23 @@
   }
 
   function classify(rows) {
-    let good = 0, bad = 0, all = 0;
+    let good = 0, bad = 0, scrap = 0;
     for (const r of rows) {
-      if (r.status === STATUS_VOID) continue; // exclude voided entries
-      all++;
+      if (r.status === STATUS_VOID) { scrap++; continue; }
       if (isDefective(r)) bad++; else good++;
     }
-    return { good, bad, all };
+    const all = good + bad + scrap;
+    return { good, bad, scrap, all };
   }
 
-  function renderSummary(container, rows, label, chinaStart, chinaEnd, totalGood, totalBad, totalAll) {
+  function fmtRate(n, d) {
+    if (!d) return '—';
+    return (n / d * 100).toFixed(1) + '%';
+  }
+
+  function renderSummary(container, rows, label, chinaStart, chinaEnd, totals) {
     const tz = localTZ();
+    const errorRows = rows.filter(r => r.error);
     container.innerHTML = `
       <div class="hint">
         本地 <b>${escapeHtml(label)}</b> (${escapeHtml(tz)}) 对应中国时间窗口：
@@ -633,26 +651,38 @@
       </div>
       <table class="summary">
         <thead>
-          <tr><th>SKU</th><th>型号</th><th>良品</th><th>不良品</th><th>总和</th></tr>
+          <tr>
+            <th>SKU</th><th>型号</th>
+            <th title="良品数（翻新结果非 Defective、未作废）">良品</th>
+            <th title="不良品数（翻新结果 = Defective、未作废）">不良品</th>
+            <th title="报废数（状态 = 作废）">报废</th>
+            <th title="良品 + 不良品 + 报废">总和</th>
+            <th title="报废 / 总和">报废率</th>
+          </tr>
         </thead>
         <tbody>
           ${rows.map(r => `
-            <tr>
+            <tr${r.error ? ' class="err-row"' : ''}>
               <td>${escapeHtml(r.model.sku)}</td>
               <td>${escapeHtml(r.model.name || r.model.model)}</td>
               <td class="good">${r.good}</td>
               <td class="bad">${r.bad}</td>
-              <td>${r.all}${r.error ? ' <span style="color:#ed4014">(失败)</span>' : ''}</td>
+              <td class="scrap">${r.scrap}</td>
+              <td>${r.all}${r.error ? ' <span class="err-tag" title="' + escapeHtml(r.error) + '">⚠</span>' : ''}</td>
+              <td class="rate">${fmtRate(r.scrap, r.all)}</td>
             </tr>
           `).join('')}
           <tr class="total">
             <td colspan="2">合计 (${rows.length} 个型号)</td>
-            <td class="good">${totalGood}</td>
-            <td class="bad">${totalBad}</td>
-            <td>${totalAll}</td>
+            <td class="good">${totals.good}</td>
+            <td class="bad">${totals.bad}</td>
+            <td class="scrap">${totals.scrap}</td>
+            <td>${totals.all}</td>
+            <td class="rate">${fmtRate(totals.scrap, totals.all)}</td>
           </tr>
         </tbody>
       </table>
+      ${errorRows.length ? `<div class="error" style="margin-top:8px">${errorRows.length} 个型号查询失败（鼠标放在 ⚠ 上看原因）</div>` : ''}
     `;
   }
 
@@ -686,9 +716,13 @@
           start: range.chinaStart,
           end:   range.chinaEnd,
         });
+        if (resp && resp.code) {
+          body.innerHTML = `<div class="error">${escapeHtml(resp.cn_message || resp.message || ('code ' + resp.code))}</div>`;
+          return;
+        }
         const data = (resp && resp.data) || [];
         const c = classify(data);
-        renderSummary(body, [{ model, ...c }], range.label, range.chinaStart, range.chinaEnd, c.good, c.bad, c.all);
+        renderSummary(body, [{ model, ...c }], range.label, range.chinaStart, range.chinaEnd, c);
       } catch (err) {
         console.error('[BESENDER 聚合] 查询失败', err);
         body.innerHTML = `<div class="error">查询失败：${escapeHtml(err.message || String(err))}</div>`;
