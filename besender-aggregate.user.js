@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.5.1
+// @version      1.5.2
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
@@ -511,8 +511,10 @@
           manage_id:    r.id ?? r.manage_id,           // manage list row id IS the manage_id
           warehouse_id: r.warehouse_id,
           sku:          r.sku || p.sku || '',
-          name:         p.sku_name || p.en_sku_name || p.cn_sku_name || p.model || r.sku || '',
+          // Display label for the 型号 column — prefer the model code (e.g. "S1-White")
+          // over the full product name (e.g. "Skyrover S1 White").
           model:        p.model || r.model || '',
+          productName:  p.sku_name || p.en_sku_name || p.cn_sku_name || '',
           auditable:    r.auditable_quantity ?? r.data_list_count ?? '',
         };
       }).filter(m => m.manage_id && m.warehouse_id);
@@ -539,7 +541,7 @@
       row.innerHTML = `
         <input type="checkbox" data-i="${i}">
         <span class="sku">${escapeHtml(m.sku)}</span>
-        <span class="name">${escapeHtml(m.name || m.model)}</span>
+        <span class="name" title="${escapeHtml(m.productName || '')}">${escapeHtml(m.model || m.productName || m.sku)}</span>
         <span class="audit">可审核 ${m.auditable}</span>
       `;
       list.appendChild(row);
@@ -653,7 +655,25 @@
 
   function renderSummary(container, rows, label, chinaStart, chinaEnd, totals) {
     const tz = localTZ();
-    const errorRows = rows.filter(r => r.error);
+    // Hide rows with zero production. Always keep error rows visible so the
+    // user knows a query failed. Single-row contexts (detail page) skip the
+    // filter — useful to confirm "查到 0" rather than show an empty table.
+    const isSingleRow = rows.length <= 1;
+    const visibleRows = isSingleRow ? rows : rows.filter(r => r.error || r.all > 0);
+    const hiddenCount = rows.length - visibleRows.length;
+    const errorRows   = visibleRows.filter(r => r.error);
+
+    if (!visibleRows.length) {
+      container.innerHTML = `
+        <div class="hint">
+          本地 <b>${escapeHtml(label)}</b> (${escapeHtml(tz)}) 对应中国时间窗口：
+          <b>${escapeHtml(chinaStart)}</b> ~ <b>${escapeHtml(chinaEnd)}</b>
+        </div>
+        <div class="empty">所选 ${rows.length} 个型号在该时段均无产出</div>
+      `;
+      return;
+    }
+
     container.innerHTML = `
       <div class="hint">
         本地 <b>${escapeHtml(label)}</b> (${escapeHtml(tz)}) 对应中国时间窗口：
@@ -671,10 +691,10 @@
           </tr>
         </thead>
         <tbody>
-          ${rows.map(r => `
+          ${visibleRows.map(r => `
             <tr${r.error ? ' class="err-row"' : ''}>
               <td>${escapeHtml(r.model.sku)}</td>
-              <td>${escapeHtml(r.model.name || r.model.model)}</td>
+              <td title="${escapeHtml(r.model.productName || '')}">${escapeHtml(r.model.model || r.model.productName || r.model.sku)}</td>
               <td class="good">${r.good}</td>
               <td class="bad">${r.bad}</td>
               <td class="scrap">${r.scrap}</td>
@@ -683,7 +703,7 @@
             </tr>
           `).join('')}
           <tr class="total">
-            <td colspan="2">合计 (${rows.length} 个型号)</td>
+            <td colspan="2">合计 (${hiddenCount > 0 ? `${visibleRows.length} 有产出 / 共 ${rows.length}` : `${visibleRows.length} 个型号`})</td>
             <td class="good">${totals.good}</td>
             <td class="bad">${totals.bad}</td>
             <td class="scrap">${totals.scrap}</td>
@@ -706,7 +726,8 @@
     const warehouse_id = params.get('warehouse_id');
     const manage_id    = params.get('manage_id');
     const sku          = params.get('sku') || '';
-    const name         = params.get('name') || params.get('model') || '';
+    const modelCode    = params.get('model') || '';
+    const productName  = params.get('name') || '';
 
     if (!warehouse_id || !manage_id) {
       body.innerHTML = '<div class="error">URL 缺少 warehouse_id 或 manage_id 参数，无法查询。</div>';
@@ -714,7 +735,7 @@
       return;
     }
 
-    const model = { sku, name, model: name, manage_id, warehouse_id, auditable: '' };
+    const model = { sku, model: modelCode, productName, manage_id, warehouse_id, auditable: '' };
 
     async function refresh() {
       const range = readPanelDateRange(panel);
