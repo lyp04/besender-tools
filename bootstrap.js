@@ -10,7 +10,10 @@
 
 (async () => {
   const PAT        = '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';
-  const RAW_URL    = 'https://raw.githubusercontent.com/lyp04/besender-tools/main/besender-aggregate.user.js';
+  // Use the GitHub Contents API rather than raw.githubusercontent.com — the API
+  // sends CORS headers for authenticated cross-origin fetches; the raw host
+  // doesn't, which causes a "Failed to fetch" in this extension context.
+  const API_URL    = 'https://api.github.com/repos/lyp04/besender-tools/contents/besender-aggregate.user.js?ref=main';
   const CACHE_KEY  = 'scriptCache';
   const LOG_PREFIX = '[BESENDER Tools]';
 
@@ -19,9 +22,12 @@
   let code    = null;
   let version = null;
   try {
-    const headers = { 'Authorization': 'Bearer ' + PAT };
+    const headers = {
+      'Authorization': 'Bearer ' + PAT,
+      'Accept':        'application/vnd.github.raw',
+    };
     if (cached && cached.etag) headers['If-None-Match'] = cached.etag;
-    const r = await fetch(RAW_URL, { headers, cache: 'no-store' });
+    const r = await fetch(API_URL, { headers, cache: 'no-store' });
 
     if (r.status === 304 && cached) {
       code    = cached.code;

@@ -1,12 +1,12 @@
 {
   "manifest_version": 3,
   "name": "BESENDER 良品/不良品聚合统计",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计。中国时间自动换算为本地时区。",
   "author": "YupengLai",
 
   "permissions": ["storage"],
-  "host_permissions": ["https://raw.githubusercontent.com/*"],
+  "host_permissions": ["https://api.github.com/*"],
 
   "content_scripts": [
     {
