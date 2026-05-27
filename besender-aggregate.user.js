@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.7.0
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按机型/SKU 反查 Anker 头程订单中的物料。中国时间自动换算为本地时区，悬停显示原始中国时间。
+// @version      1.7.1
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+机型/SKU 反查在途/入库中订单的物料。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -873,10 +873,14 @@
       </header>
       <div class="body">
         <div class="hint">
-          输入<b>机型</b>（2080 / 2280 / 2351 / 2353，2352 物料计入 2353）<i>或</i> <b>SKU/产品名</b>，
-          脚本会拉取当前筛选下所有 <b>Anker</b> 头程入库订单的详情并聚合命中物料。
+          选择<b>公司</b>，再输入<b>机型</b>（2080 / 2280 / 2351 / 2353，2352 物料计入 2353）<i>或</i> <b>SKU/产品名</b>，
+          脚本会拉取该公司<b>在途 + 入库中</b>的头程入库订单详情并聚合命中物料。
         </div>
         <div class="search-form">
+          <div class="form-row">
+            <label>公司</label>
+            <select class="company-select">${buildCompanyOptionsHtml()}</select>
+          </div>
           <div class="form-row">
             <label>机型</label>
             <input type="text" class="model-input" placeholder="如 2353" autocomplete="off">
@@ -886,7 +890,7 @@
             <input type="text" class="sku-input" placeholder="如 T2353_雷达盖-售后 / MR_20002003205（支持部分匹配）" autocomplete="off">
           </div>
           <div class="form-row form-hint">
-            <span>两项至少填一项。同时填写时以「机型」优先。</span>
+            <span>机型与 SKU 两项至少填一项。同时填写时以「机型」优先。</span>
           </div>
         </div>
         <div class="result"></div>
@@ -902,24 +906,67 @@
     initInboundPanel(panel);
   }
 
-  function initInboundPanel(panel) {
-    const body       = panel.querySelector('.body');
-    const result     = panel.querySelector('.result');
-    const modelInput = panel.querySelector('.model-input');
-    const skuInput   = panel.querySelector('.sku-input');
-    const runBtn     = panel.querySelector('.search-btn');
+  // Pull the cached company list out of the page's Vuex store. Falls back to []
+  // if the store shape changes; the panel still renders, just without options.
+  function getCompanyList() {
+    try {
+      const root = document.querySelector('#app');
+      const vue  = root && root.__vue__;
+      const list = vue && vue.$store && vue.$store.state
+                && vue.$store.state.user && vue.$store.state.user.companyList;
+      return Array.isArray(list) ? list : [];
+    } catch (_) { return []; }
+  }
 
-    result.innerHTML = '<div class="empty">请输入机型或 SKU 后点击「搜索」</div>';
+  function buildCompanyOptionsHtml() {
+    const list = getCompanyList();
+    if (!list.length) {
+      // No companyList means user filter won't work — fall back to all orders.
+      return '<option value="">（公司列表未加载，搜索全部）</option>';
+    }
+    const sorted = list.slice().sort((a, b) =>
+      String(a.company || a.cn_company || '').localeCompare(String(b.company || b.cn_company || '')));
+    return sorted.map(c => {
+      const id = c.id;
+      const label = c.company || c.cn_company || ('公司 ' + id);
+      const isAnker = /^anker$/i.test(c.company || '');
+      return `<option value="${id}"${isAnker ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+    }).join('');
+  }
+
+  function initInboundPanel(panel) {
+    const body          = panel.querySelector('.body');
+    const result        = panel.querySelector('.result');
+    const companySelect = panel.querySelector('.company-select');
+    const modelInput    = panel.querySelector('.model-input');
+    const skuInput      = panel.querySelector('.sku-input');
+    const runBtn        = panel.querySelector('.search-btn');
+
+    result.innerHTML = '<div class="empty">请选择公司并输入机型或 SKU 后点击「搜索」</div>';
 
     async function run() {
       const model = modelInput.value.trim();
       const sku   = skuInput.value.trim();
       if (!model && !sku) { flash(body, '请输入机型或 SKU'); return; }
 
+      const companyId    = companySelect.value;
+      const companyLabel =
+        (companySelect.options[companySelect.selectedIndex] || {}).textContent || '所选公司';
+
       runBtn.disabled = true;
       try {
         result.innerHTML = '<div class="loading">读取订单列表…</div>';
+        // Mirror the page's own list filters (date range, keyword, …) and
+        // then force the two filters this feature requires:
+        //   - user_id: the selected company
+        //   - status:  in-transit (2) + in-storage (3); finished/cancelled
+        //              orders carry no live inventory so we exclude them.
+        // The API rejects array `status` (returns 500) — must be CSV string.
         const liveQuery = readInboundPageQuery() || {};
+        if (companyId) liveQuery.user_id = Number(companyId);
+        else           delete liveQuery.user_id;
+        liveQuery.status = '2,3';
+
         let orders;
         try {
           orders = await fetchAllInboundOrders(liveQuery);
@@ -928,18 +975,17 @@
           result.innerHTML = `<div class="error">获取订单列表失败：${escapeHtml(err.message || String(err))}</div>`;
           return;
         }
-        const ankerOrders = orders.filter(isAnkerOrder);
-        if (!ankerOrders.length) {
-          result.innerHTML = `<div class="empty">当前筛选条件下共 ${orders.length} 个订单，未筛出 Anker 订单</div>`;
+        if (!orders.length) {
+          result.innerHTML = `<div class="empty">${escapeHtml(companyLabel)} 名下没有头程入库订单</div>`;
           return;
         }
 
-        result.innerHTML = `<div class="progress">查询订单详情 0/${ankerOrders.length}…</div>`;
+        result.innerHTML = `<div class="progress">查询 ${escapeHtml(companyLabel)} 订单详情 0/${orders.length}…</div>`;
         const matches = [];
         const failed  = [];
         let processed = 0;
         const CONCURRENCY = 5;
-        const queue = ankerOrders.slice();
+        const queue = orders.slice();
         const fetchOne = async (ord) => {
           try {
             const resp = await apiGet(API.inboundDetail, { id: ord.id });
@@ -960,7 +1006,7 @@
           } finally {
             processed++;
             const prog = result.querySelector('.progress');
-            if (prog) prog.textContent = `查询订单详情 ${processed}/${ankerOrders.length}…`;
+            if (prog) prog.textContent = `查询 ${companyLabel} 订单详情 ${processed}/${orders.length}…`;
           }
         };
         const workers = [];
@@ -975,7 +1021,8 @@
         await Promise.all(workers);
         renderInboundMatches(result, matches, {
           model, sku,
-          totalOrders: ankerOrders.length,
+          company:     companyLabel,
+          totalOrders: orders.length,
           failedCount: failed.length,
         });
       } finally {
@@ -1050,30 +1097,22 @@
     return rows;
   }
 
-  function isAnkerOrder(o) {
-    const company =
-      (o && o.user_info && o.user_info.company) ||
-      o.company ||
-      o.company_name ||
-      '';
-    return /anker/i.test(String(company));
-  }
-
-  // The detail response nests items inside packages / boxes (shape varies).
-  // Walk the tree and collect any object that has both a `sku` and looks
-  // item-shaped (has a quantity field or sku_info / sku_name companion).
+  // The detail response nests items inside packages[].items[]; each item also
+  // carries a nested `sku_info` that mirrors `sku`/`sku_name` (for the product
+  // catalog row). A naive walker would collect both — leading to double counts.
+  // We only accept nodes that carry a real quantity field, which uniquely
+  // identifies the item row and excludes the catalog mirror.
   function extractInboundItems(detail) {
+    const QTY_KEYS = ['quantity', 'request_num', 'confirm_num', 'receive_quantity'];
     const out  = [];
     const seen = new WeakSet();
     function walk(node) {
       if (!node || typeof node !== 'object' || seen.has(node)) return;
       seen.add(node);
       if (Array.isArray(node)) { node.forEach(walk); return; }
-      const hasSku  = 'sku' in node && node.sku != null && node.sku !== '';
-      const hasMeta = node.sku_info || node.sku_name || node.cn_sku_name || node.en_sku_name
-                     || 'quantity' in node || 'request_num' in node
-                     || 'confirm_num' in node || 'receive_quantity' in node;
-      if (hasSku && hasMeta) out.push(node);
+      const hasSku = 'sku' in node && node.sku != null && node.sku !== '';
+      const hasQty = QTY_KEYS.some(k => k in node && node[k] != null);
+      if (hasSku && hasQty) out.push(node);
       for (const k of Object.keys(node)) {
         const v = node[k];
         if (v && typeof v === 'object') walk(v);
@@ -1085,8 +1124,12 @@
 
   function productNameOf(item) {
     const info = item.sku_info || {};
+    // Real items expose sku_name directly; sku_info carries the catalog mirror
+    // (cn_sku_name / en_sku_name) — prefer the cn/en variants when present
+    // so the displayed name matches the page UI.
     return info.cn_sku_name || info.en_sku_name
-        || item.sku_name || item.product_name || item.cn_sku_name || item.en_sku_name || '';
+        || item.cn_sku_name || item.en_sku_name
+        || item.sku_name    || item.product_name || '';
   }
 
   // Match by 4-digit machine model code embedded in the product name or SKU.
@@ -1122,14 +1165,15 @@
   }
 
   function renderInboundMatches(container, matches, ctx) {
-    const { model, sku, totalOrders, failedCount } = ctx;
+    const { model, sku, company, totalOrders, failedCount } = ctx;
     const queryLabel = model
       ? `机型 <b>${escapeHtml(model)}</b>${model === '2353' ? '（含 2352）' : ''}`
       : `SKU/产品名 <b>${escapeHtml(sku)}</b>`;
+    const companyTag = company ? `<b>${escapeHtml(company)}</b>` : '所选公司';
 
     if (!matches.length) {
       container.innerHTML = `
-        <div class="hint">${queryLabel}：在 ${totalOrders} 个 Anker 订单中未找到匹配物料。</div>
+        <div class="hint">${queryLabel}：在 ${companyTag} 的 ${totalOrders} 个在途/入库中订单中未找到匹配物料。</div>
         ${failedCount ? `<div class="error" style="margin-top:8px">${failedCount} 个订单查询失败（详见 console）</div>` : ''}
       `;
       return;
@@ -1159,7 +1203,7 @@
     });
 
     container.innerHTML = `
-      <div class="hint">${queryLabel}：在 ${totalOrders} 个 Anker 订单中，命中 ${total.orders.size} 个订单 / ${rows.length} 个 SKU</div>
+      <div class="hint">${queryLabel}：在 ${companyTag} 的 ${totalOrders} 个在途/入库中订单中，命中 ${total.orders.size} 个订单 / ${rows.length} 个 SKU</div>
       <table class="summary">
         <thead>
           <tr><th>SKU</th><th>产品名称</th><th>申请总数</th><th>确认总数</th><th>订单数</th></tr>
