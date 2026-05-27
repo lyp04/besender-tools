@@ -1,19 +1,11 @@
 // BESENDER Tools — bootstrap content script.
 //
-// Fetches the latest `besender-aggregate.user.js` from the private GitHub repo
-// and injects it into the page's main world via a Blob-URL <script> tag.
-// ETag conditional requests make subsequent loads ~50 ms (HTTP 304).
-//
-// The PAT below is a read-only fine-grained token scoped to this single repo.
-// It is not a credential to any production system — it can only read this
-// extension's source code. The repo owner has accepted the trade-off.
+// Asks the background service worker to fetch the latest
+// besender-aggregate.user.js, then injects it into the page's main world via
+// a Blob-URL <script> tag. Caches code + ETag in chrome.storage.local so
+// subsequent loads use If-None-Match conditional requests (HTTP 304).
 
 (async () => {
-  const PAT        = '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';
-  // Use the GitHub Contents API rather than raw.githubusercontent.com — the API
-  // sends CORS headers for authenticated cross-origin fetches; the raw host
-  // doesn't, which causes a "Failed to fetch" in this extension context.
-  const API_URL    = 'https://api.github.com/repos/lyp04/besender-tools/contents/besender-aggregate.user.js?ref=main';
   const CACHE_KEY  = 'scriptCache';
   const LOG_PREFIX = '[BESENDER Tools]';
 
@@ -21,35 +13,36 @@
 
   let code    = null;
   let version = null;
-  try {
-    const headers = {
-      'Authorization': 'Bearer ' + PAT,
-      'Accept':        'application/vnd.github.raw',
-    };
-    if (cached && cached.etag) headers['If-None-Match'] = cached.etag;
-    const r = await fetch(API_URL, { headers, cache: 'no-store' });
 
-    if (r.status === 304 && cached) {
-      code    = cached.code;
-      version = cached.version;
-    } else if (r.ok) {
-      code    = await r.text();
-      version = (code.match(/@version\s+(\S+)/) || [])[1] || null;
-      await chrome.storage.local.set({
-        [CACHE_KEY]: { code, etag: r.headers.get('ETag') || '', ts: Date.now(), version },
-      });
-    } else {
-      throw new Error('HTTP ' + r.status);
-    }
-  } catch (err) {
-    if (cached && cached.code) {
-      console.warn(LOG_PREFIX, '拉取失败，使用缓存：', err && err.message);
-      code    = cached.code;
-      version = cached.version;
-    } else {
-      console.error(LOG_PREFIX, '拉取失败且无缓存：', err);
-      return;
-    }
+  const response = await new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      { type: 'bsd-fetch-script', etag: cached && cached.etag },
+      (resp) => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, err: chrome.runtime.lastError.message });
+        } else {
+          resolve(resp || { ok: false, err: 'empty response' });
+        }
+      }
+    );
+  });
+
+  if (response.ok && response.notModified && cached) {
+    code    = cached.code;
+    version = cached.version;
+  } else if (response.ok && response.code) {
+    code    = response.code;
+    version = (code.match(/@version\s+(\S+)/) || [])[1] || null;
+    await chrome.storage.local.set({
+      [CACHE_KEY]: { code, etag: response.etag || '', ts: Date.now(), version },
+    });
+  } else if (cached && cached.code) {
+    console.warn(LOG_PREFIX, '拉取失败，使用缓存：', response.err || ('HTTP ' + response.status), response.body || '');
+    code    = cached.code;
+    version = cached.version;
+  } else {
+    console.error(LOG_PREFIX, '拉取失败且无缓存：', response.err || ('HTTP ' + response.status), response.body || '');
+    return;
   }
 
   if (!code) return;
