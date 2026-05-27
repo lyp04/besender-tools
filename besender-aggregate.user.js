@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.7.2
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料。中国时间自动换算为本地时区，悬停显示原始中国时间。
+// @version      1.7.3
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -328,6 +328,36 @@
       #${PANEL_ID} .form-row.form-hint span {
         color: #999; font-size: 11.5px;
       }
+
+      #${PANEL_ID} .expand-btn {
+        background: transparent; border: 1px solid #d0d4dc; padding: 2px 8px;
+        border-radius: 4px; cursor: pointer; font-size: 12px; color: #515a6e;
+        line-height: 1.4;
+      }
+      #${PANEL_ID} .expand-btn:hover {
+        background: #f0f7ff; color: #2d8cf0; border-color: #2d8cf0;
+      }
+      #${PANEL_ID} .expand-btn .caret {
+        margin-left: 4px; color: #888; font-size: 10px;
+      }
+      #${PANEL_ID} tr.detail-row > td {
+        padding: 6px 12px 8px; background: #fafbfd;
+      }
+      #${PANEL_ID} table.sub-table {
+        width: 100%; border-collapse: collapse; font-size: 12px;
+      }
+      #${PANEL_ID} table.sub-table th, #${PANEL_ID} table.sub-table td {
+        padding: 4px 8px; border-bottom: 1px solid #eef1f6; text-align: left;
+      }
+      #${PANEL_ID} table.sub-table th {
+        color: #888; font-weight: 600; background: transparent;
+      }
+      #${PANEL_ID} .order-link {
+        background: transparent; border: none; padding: 0; cursor: pointer;
+        color: #2d8cf0; font-family: ui-monospace, monospace; font-size: 12px;
+        text-decoration: underline;
+      }
+      #${PANEL_ID} .order-link:hover { color: #1573d9; }
 
       .${TIME_CLS} {
         border-bottom: 1px dotted #2d8cf0;
@@ -1280,22 +1310,34 @@
       return;
     }
 
-    // Aggregate by SKU.
+    // Aggregate by SKU; keep the underlying per-order rows so the user can
+    // expand each SKU to see which order it's coming from + ETA.
     const bySku = new Map();
     for (const { order, item } of matches) {
       const key = item.sku || productNameOf(item) || 'unknown';
       let e = bySku.get(key);
       if (!e) {
         e = { sku: item.sku || '', name: productNameOf(item),
-              req: 0, conf: 0, orders: new Set(), orderNos: [] };
+              req: 0, conf: 0, orders: new Set(), entries: [] };
         bySku.set(key, e);
       }
-      e.req  += quantityRequest(item);
-      e.conf += quantityConfirm(item);
-      const tag = order.order_no || order.id;
-      if (!e.orders.has(tag)) { e.orders.add(tag); e.orderNos.push(tag); }
+      const req  = quantityRequest(item);
+      const conf = quantityConfirm(item);
+      e.req  += req;
+      e.conf += conf;
+      e.orders.add(order.order_no || order.id);
+      e.entries.push({
+        orderId:    order.id,
+        orderNo:    order.order_no || String(order.id),
+        statusCode: order.status,
+        etaMs:      expectedArrivalTs(order),
+        expectIn:   order.expect_in_time || null,
+        createdAt:  order.created_at || null,
+        req, conf,
+      });
     }
     const rows  = Array.from(bySku.values()).sort((a, b) => b.req - a.req);
+    rows.forEach(r => r.entries.sort((a, b) => (a.etaMs || 0) - (b.etaMs || 0)));
     const total = { req: 0, conf: 0, orders: new Set() };
     rows.forEach(r => {
       total.req  += r.req;
@@ -1303,20 +1345,53 @@
       r.orders.forEach(o => total.orders.add(o));
     });
 
+    const statusLabel = (s) => s === 2 ? '在途' : s === 3 ? '入库中' : '';
+    const fmtEntryEta = (e) => {
+      if (e.expectIn) {
+        // expect_in_time can be date-only ("2026-04-15") or full datetime.
+        const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(e.expectIn).trim());
+        if (dateOnly) return `${dateOnly[1]}-${dateOnly[2]}-${dateOnly[3]} (预计)`;
+        const t = parseServerTime(e.expectIn);
+        return t ? `${fmtInTZ(t, localTZ()).slice(0, 10)} (预计)` : `${escapeHtml(e.expectIn)} (预计)`;
+      }
+      if (e.etaMs != null) {
+        return `${fmtInTZ(new Date(e.etaMs), localTZ()).slice(0, 10)} (估)`;
+      }
+      return '—';
+    };
+
     container.innerHTML = `
-      <div class="hint">${queryLabel}：在 ${companyTag} 的 ${scopeTag} 中，命中 ${total.orders.size} 个订单 / ${rows.length} 个 SKU</div>
+      <div class="hint">${queryLabel}：在 ${companyTag} 的 ${scopeTag} 中，命中 ${total.orders.size} 个订单 / ${rows.length} 个 SKU。<br>点击「订单数」列展开查看每单的预计到达时间，订单号可点击跳转详情。</div>
       <table class="summary">
         <thead>
           <tr><th>SKU</th><th>产品名称</th><th>申请总数</th><th>确认总数</th><th>订单数</th></tr>
         </thead>
         <tbody>
-          ${rows.map(r => `
-            <tr>
+          ${rows.map((r, i) => `
+            <tr class="sku-row" data-idx="${i}">
               <td>${escapeHtml(r.sku)}</td>
               <td title="${escapeHtml(r.name)}">${escapeHtml(r.name)}</td>
               <td class="good">${r.req}</td>
               <td>${r.conf}</td>
-              <td title="${escapeHtml(r.orderNos.join(', '))}">${r.orders.size}</td>
+              <td><button type="button" class="expand-btn" data-idx="${i}">${r.orders.size} <span class="caret">▶</span></button></td>
+            </tr>
+            <tr class="detail-row" data-parent-idx="${i}" style="display:none">
+              <td colspan="5">
+                <table class="sub-table">
+                  <thead><tr><th>订单号</th><th>状态</th><th>预计到达</th><th>申请</th><th>确认</th></tr></thead>
+                  <tbody>
+                    ${r.entries.map(e => `
+                      <tr>
+                        <td><button type="button" class="order-link" data-order-id="${e.orderId}" title="跳转到该订单详情">${escapeHtml(e.orderNo)}</button></td>
+                        <td>${escapeHtml(statusLabel(e.statusCode))}</td>
+                        <td>${fmtEntryEta(e)}</td>
+                        <td>${e.req}</td>
+                        <td>${e.conf}</td>
+                      </tr>
+                    `).join('')}
+                  </tbody>
+                </table>
+              </td>
             </tr>
           `).join('')}
           <tr class="total">
@@ -1329,6 +1404,37 @@
       </table>
       ${failedCount ? `<div class="error" style="margin-top:8px">${failedCount} 个订单查询失败（详见 console）</div>` : ''}
     `;
+
+    // Event delegation: expand toggle + order-detail jump.
+    container.addEventListener('click', onResultClick);
+  }
+
+  function onResultClick(e) {
+    const expandBtn = e.target.closest('.expand-btn');
+    if (expandBtn) {
+      const idx    = expandBtn.dataset.idx;
+      const detail = expandBtn.closest('table')
+        .querySelector(`tr.detail-row[data-parent-idx="${idx}"]`);
+      if (!detail) return;
+      const opening = detail.style.display === 'none';
+      detail.style.display = opening ? '' : 'none';
+      const caret = expandBtn.querySelector('.caret');
+      if (caret) caret.textContent = opening ? '▼' : '▶';
+      return;
+    }
+    const orderBtn = e.target.closest('.order-link');
+    if (orderBtn) {
+      const oid = orderBtn.dataset.orderId;
+      if (!oid) return;
+      // Mirror the page's own row-click handler: stash the id in sessionStorage
+      // and let Vue Router transition to the detail route.
+      try { sessionStorage.setItem('headInboundDetailId', oid); } catch (_) {}
+      try {
+        const v = document.querySelector('#app').__vue__;
+        if (v && v.$router) { v.$router.push({ path: 'head_entry_detail' }); return; }
+      } catch (_) {}
+      location.href = '/bsd-warehouse/in_order/head_entry_detail';
+    }
   }
 
   // ── Page-2 timestamp decoration (China time → local + hover tooltip) ────
