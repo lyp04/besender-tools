@@ -1,14 +1,15 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.2.0
+// @version      1.3.0
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
 // @grant        none
+// @updateURL    https://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@raw.githubusercontent.com/lyp04/besender-tools/main/besender-aggregate.user.js
+// @downloadURL  https://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@raw.githubusercontent.com/lyp04/besender-tools/main/besender-aggregate.user.js
 // ==/UserScript==
-// Note: this file also serves as the Chrome extension content script — see manifest.json.
 
 // Co-authored by Claude (Anthropic) — AI-assisted development
 

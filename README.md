@@ -1,77 +1,57 @@
 # besender-tools
 
-`bms.besender.com` 的 Chrome 扩展，聚合良品/不良品/总和。
+`bms.besender.com` 的 Tampermonkey 用户脚本，聚合良品/不良品/总和。
 
 ## 功能
 
 - **型号列表页 (`/single/refurbish`)**：勾选多个型号 → 汇总良品 / 不良品 / 总和
 - **详情页 (`/single/retreadDetail`)**：直接看当日 / 区间统计
-- **单日 / 区间** 两种日期模式
-- 中国时间自动换算到本地时区，悬停显示原始中国时间
-
-## 架构
-
-私库 + 真 Chrome 扩展 + 自动云端更新 —— 这三件事原生 Chrome 不支持，所以这么拆：
-
-```
-扩展本体（一次安装，几乎不再变）：
-├── manifest.json      MV3
-├── bootstrap.js       每次开 BESENDER 页面跑，从 GitHub 拉最新代码注入
-└── README.md
-
-GitHub 私库（频繁更新）：
-└── besender-aggregate.user.js     业务逻辑，pull 后下次刷新自动生效
-```
-
-`bootstrap.js` 用 ETag 条件请求 GitHub raw —— 未变就 304 (几十毫秒)，变了
-才下新代码。
-
-`bootstrap.js` 里硬编码了一个**只读** GitHub PAT，仅作用于本私库的 Contents
-读取权限。可接受的风险：泄漏了攻击者只能读这份代码，进不了 BESENDER 后台
-（PAT 不是 BESENDER 凭据）。
+- **单日 / 区间** 两种日期模式（面板里切换）
+- 中国时间自动换算到本地时区，鼠标悬停显示原始中国时间
 
 ## 安装
 
-```bash
-git clone https://github.com/lyp04/besender-tools.git ~/Code/besender-tools
+需要 Tampermonkey 扩展。然后在 Chrome 打开下面这个 URL：
+
+```
+https://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@raw.githubusercontent.com/lyp04/besender-tools/main/besender-aggregate.user.js
 ```
 
-1. Chrome 打开 `chrome://extensions/`
-2. 右上角开「开发者模式」
-3. 「加载已解压的扩展程序」→ 选 `~/Code/besender-tools`
-4. 打开 BESENDER 页面，右下角出现 📊 FAB 即成功
+Tampermonkey 会弹安装对话框，点「Install」即完成。
 
-控制台第一次会打印 `[BESENDER Tools] 已注入 v1.2.0`（或当前版本）。
-
-## 更新
-
-啥都不用做。我 push 新代码到 `main` → 你下次打开 BESENDER 页面 `bootstrap.js`
-自动拉到 → 注入。
-
-强制刷新（极少需要）：`chrome://extensions/` → 这个扩展卡片上点 🔄 reload。
-
-## 卸载 Tampermonkey 版本
-
-如果之前装过 Tampermonkey 版本，记得删掉，不然会有两个 FAB：
-
-Tampermonkey 图标 → 管理面板 → 找到「BESENDER 良品/不良品聚合统计」→ 删除。
+PAT 已经烤进 `@updateURL` / `@downloadURL`，所以 Tampermonkey 会用同一个
+URL 定时检查更新。我推新版本到 GitHub，下次 Tampermonkey 检查（默认每
+天）就会自动拉到。如果想立即更新：Tampermonkey 控制台 → 该脚本 → 「检查
+更新」。
 
 ## 开发
 
 ```bash
-cd ~/Code/besender-tools
-# 改 besender-aggregate.user.js (顺手 bump @version)
+# 改 besender-aggregate.user.js，记得 bump @version
 git add besender-aggregate.user.js
 git commit -m "..."
 git push
 ```
 
-下次任何人开 BESENDER 页面，下次刷新即生效。
+下次 Tampermonkey 检查更新（或用户手动「检查更新」）就拿到新版本。
 
-## 文件
+## PAT 说明
 
-- `manifest.json` — Chrome 扩展清单 (MV3)
-- `bootstrap.js` — content script，从 GitHub 拉远程业务代码
-- `besender-aggregate.user.js` — 业务逻辑，顶部保留了 `==UserScript==` 头
-  以便回退到 Tampermonkey 模式
-- `README.md` — 本文件
+`@updateURL` / `@downloadURL` 里包含一个只读 fine-grained PAT，仅对本私库
+的 Contents 有读权限。trade-off：泄漏了攻击者只能读这份代码（这份代码本身
+就是给同事看的），进不了 BESENDER 后台（PAT 不是 BESENDER 凭据）。
+
+如果需要换 PAT：
+
+1. <https://github.com/settings/personal-access-tokens> 撤销旧的
+2. 生成新的（Repository = `lyp04/besender-tools`, Contents = Read-only, No expiration）
+3. `sed -i '' 's|github_pat_old|github_pat_new|g' besender-aggregate.user.js`
+4. `git commit && git push`
+5. 已安装的用户在 Tampermonkey 里手动「检查更新」一次就拿到新 PAT 版本
+
+## 历史
+
+- v1.3.0 — 回到纯 Tampermonkey + 自动更新（PAT 烤进 @updateURL）
+- v1.2.x — 试过包成 MV3 Chrome 扩展，被页面 CSP 拦下，放弃
+- v1.1.0 — 修了 page-1 组件识别 bug + 不良品判定逻辑
+- v1.0.0 — 初版
