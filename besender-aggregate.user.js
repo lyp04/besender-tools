@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.5.3
+// @version      1.6.0
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
@@ -77,9 +77,55 @@
     return `${get('year')}-${get('month')}-${get('day')} ${hour}:${get('minute')}:${get('second')}`;
   }
 
-  function localTZ() {
+  function systemTZ() {
     try { return Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC'; }
     catch (_) { return 'UTC'; }
+  }
+
+  // Timezone the user is viewing the data in. Persisted across page loads.
+  const TZ_STORAGE_KEY = 'bsd-agg-tz';
+  const TZ_OPTIONS = [
+    ['美东',     'America/New_York'],
+    ['美中',     'America/Chicago'],
+    ['美西',     'America/Los_Angeles'],
+    ['德国',     'Europe/Berlin'],
+    ['澳大利亚', 'Australia/Sydney'],
+    ['中国',     'Asia/Shanghai'],
+  ];
+  let userTZ = (() => {
+    try { return localStorage.getItem(TZ_STORAGE_KEY) || ''; }
+    catch (_) { return ''; }
+  })();
+  function localTZ() { return userTZ || systemTZ(); }
+  function setUserTZ(tz) {
+    userTZ = tz || '';
+    try {
+      if (userTZ) localStorage.setItem(TZ_STORAGE_KEY, userTZ);
+      else        localStorage.removeItem(TZ_STORAGE_KEY);
+    } catch (_) {}
+  }
+  function buildTzOptionsHtml() {
+    const sys = systemTZ();
+    const list = TZ_OPTIONS.map(([label, tz]) => ({ label, tz }));
+    if (!list.find(o => o.tz === sys)) {
+      list.unshift({ label: `系统 (${sys})`, tz: sys });
+    }
+    const selected = localTZ();
+    return list.map(o =>
+      `<option value="${escapeHtml(o.tz)}"${o.tz === selected ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
+    ).join('');
+  }
+  // Re-render every already-decorated <span class="bsd-agg-time"> when the
+  // active timezone changes.
+  function relabelDecoratedTimes() {
+    const tz = localTZ();
+    document.querySelectorAll('.' + TIME_CLS).forEach(el => {
+      const china = el.dataset.china;
+      if (!china) return;
+      const utc = parseServerTime(china);
+      el.textContent = utc ? fmtInTZ(utc, tz) : china;
+      el.dataset.localTz = tz;
+    });
   }
 
   // For a local-calendar date "YYYY-MM-DD" return [chinaStartStr, chinaEndStr] covering that
@@ -209,9 +255,9 @@
         display: flex; align-items: center; gap: 8px; justify-content: flex-end;
       }
       #${PANEL_ID} footer label.date-label { font-size: 12px; color: #666; }
-      #${PANEL_ID} input[type="date"] {
+      #${PANEL_ID} input[type="date"], #${PANEL_ID} .tz-select {
         padding: 5px 8px; border: 1px solid #ddd; border-radius: 4px;
-        font-size: 13px; color: #333;
+        font-size: 13px; color: #333; background: #fff;
       }
       #${PANEL_ID} .btn {
         padding: 6px 14px; border-radius: 4px; border: 1px solid #2d8cf0;
@@ -392,6 +438,7 @@
     const today = localTodayStr();
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
+    panel.dataset.panelKind = kind;
     panel.innerHTML = `
       <header>
         <span class="title">${kind === 'list' ? '勾选型号汇总' : (kind === 'detail' ? '当前型号统计' : 'BESENDER 聚合')}</span>
@@ -414,6 +461,8 @@
             <label class="date-label">到</label>
             <input type="date" class="date-end"   value="${today}">
           </div>
+          <label class="date-label tz-label">时区</label>
+          <select class="tz-select">${buildTzOptionsHtml()}</select>
         </div>
         <div class="footer-actions">
           ${kind === 'list' ? '<button class="btn ghost select-all">全选</button>' : ''}
@@ -422,6 +471,18 @@
       </footer>
     `;
     panel.querySelector('.close').addEventListener('click', () => panel.remove());
+
+    // Timezone switcher — affects date interpretation + all decorated timestamps.
+    const tzSelect = panel.querySelector('.tz-select');
+    tzSelect.addEventListener('change', () => {
+      setUserTZ(tzSelect.value);
+      relabelDecoratedTimes();
+      // Detail panel re-queries automatically (date interpretation changed).
+      // List panel keeps the previously-rendered summary until the user clicks 查询 again.
+      if (panel.dataset.panelKind === 'detail') {
+        panel.querySelector('.run')?.click();
+      }
+    });
 
     // Wire mode tabs
     const tabs   = panel.querySelectorAll('.mode-tab');
