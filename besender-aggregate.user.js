@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.7.3
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情。中国时间自动换算为本地时区，悬停显示原始中国时间。
+// @version      1.8.0
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -42,6 +42,7 @@
     retreadAll:        '/retreadOptimized/retreadDataListNoPage',
     inboundList:       '/warehouse/warehouse/inboundOrderList',
     inboundDetail:     '/warehouse/warehouse/getInboundOrder',
+    orderList:         '/engineer/afterSale/orderList',  // DOA + 维修(RP) 共用
   };
 
   // ── Page routing ────────────────────────────────────────────────────────
@@ -53,6 +54,8 @@
     // head_entry_detail is intentionally not aggregable — the panel only opens on the list page.
     if (/\/in_order\/head_entry_detail(\b|$)/.test(p)) return 'other';
     if (/\/in_order\/head_entry(\b|$)/.test(p))        return 'inbound';
+    if (/\/engineerDoa(\b|$)/.test(p))                 return 'doa';
+    if (/\/engineerRepair(\b|$)/.test(p))              return 'rp';
     return 'other';
   }
 
@@ -481,6 +484,8 @@
 
   function fabLabelFor(kind) {
     if (kind === 'inbound') return '🔍 物料/机型搜索';
+    if (kind === 'doa')     return '📊 DOA 完成统计';
+    if (kind === 'rp')      return '📊 RP 完成统计';
     return '📊 良品/不良品聚合';
   }
 
@@ -511,6 +516,7 @@
   function openPanel() {
     const kind = pageKind();
     if (kind === 'inbound') { openInboundPanel(); return; }
+    if (kind === 'doa' || kind === 'rp') { openOrderCountPanel(kind); return; }
     const today = localTodayStr();
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
@@ -1577,11 +1583,208 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
+  // ── DOA / 维修(RP) 完成订单统计 ─────────────────────────────────────────
+  //
+  // engineerDoa 与 engineerRepair 列表页共用 /engineer/afterSale/orderList。
+  // 面板按本地日期(单日/区间, 受时区选择器影响)换算出中国时间窗口，统计「完成」
+  // 状态订单数量；公司及关键字等条件沿用页面顶部自带的搜索筛选(读取其 query)。
+  // DOA 页可勾选「同时统计 RP」、RP 页可勾选「同时统计 DOA」，给出 DOA+RP 合计。
+
+  // 订单工作流状态：'1' 进行中 / '2' 完成。本功能始终统计「完成」。
+  const OC_STATUS_DONE = '2';
+  // time_type：'1' 下单时间 / '2' 完成时间。
+  const OC_TIME_COMPLETION = '2';
+  const OC_TIME_START      = '1';
+  // 各页订单类型筛选(取自各自页面 query 对象)。
+  const OC_TYPE = {
+    doa: { type: '15' },
+    rp:  { type_arr: '1,2', is_child: 0 },
+  };
+  const OC_LABEL = { doa: 'DOA', rp: 'RP（维修）' };
+
+  function openOrderCountPanel(kind) {
+    const today = localTodayStr();
+    const other = kind === 'doa' ? 'rp' : 'doa';
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.dataset.panelKind = kind;
+    panel.dataset.dateMode  = 'single';
+    panel.innerHTML = `
+      <header>
+        <span class="title">${OC_LABEL[kind]} 完成统计</span>
+        <span class="close" title="关闭">✕</span>
+      </header>
+      <div class="body"><div class="empty">选择日期后点「查询」。公司及其余条件沿用页面顶部筛选，状态固定为「完成」。</div></div>
+      <footer>
+        <div class="date-controls">
+          <div class="mode-tabs" role="tablist">
+            <button class="mode-tab active" data-mode="single" role="tab">单日</button>
+            <button class="mode-tab"        data-mode="range"  role="tab">区间</button>
+          </div>
+          <div class="date-fields single">
+            <label class="date-label">本地日期</label>
+            <input type="date" class="date-input" value="${today}">
+          </div>
+          <div class="date-fields range" style="display:none">
+            <label class="date-label">从</label>
+            <input type="date" class="date-start" value="${today}">
+            <label class="date-label">到</label>
+            <input type="date" class="date-end"   value="${today}">
+          </div>
+          <label class="date-label tz-label">时区</label>
+          <select class="tz-select">${buildTzOptionsHtml()}</select>
+        </div>
+        <div class="footer-actions">
+          <label class="date-label">时间口径</label>
+          <select class="time-select">
+            <option value="${OC_TIME_COMPLETION}">完成时间</option>
+            <option value="${OC_TIME_START}">下单时间</option>
+          </select>
+          <label class="date-label" style="display:flex;align-items:center;gap:4px;cursor:pointer">
+            <input type="checkbox" class="cross-cb"> 同时统计 ${OC_LABEL[other]}
+          </label>
+          <span style="flex:1"></span>
+          <button class="btn run">查询</button>
+        </div>
+      </footer>
+    `;
+    panel.querySelector('.close').addEventListener('click', () => panel.remove());
+
+    // 时区切换(与其它面板共用行为)。
+    const tzSelect = panel.querySelector('.tz-select');
+    tzSelect.addEventListener('change', () => {
+      setUserTZ(tzSelect.value);
+      relabelDecoratedTimes();
+    });
+
+    // 单日 / 区间 切换。
+    const tabs   = panel.querySelectorAll('.mode-tab');
+    const single = panel.querySelector('.date-fields.single');
+    const range  = panel.querySelector('.date-fields.range');
+    tabs.forEach(t => t.addEventListener('click', () => {
+      tabs.forEach(x => x.classList.toggle('active', x === t));
+      const m = t.dataset.mode;
+      single.style.display = m === 'single' ? '' : 'none';
+      range .style.display = m === 'range'  ? '' : 'none';
+      panel.dataset.dateMode = m;
+    }));
+
+    panel.querySelector('.run').addEventListener('click', () => runOrderCount(panel, kind));
+    document.body.appendChild(panel);
+  }
+
+  // 读取当前 engineerDoa / engineerRepair 列表组件的 query(含页面顶部 公司=user_id
+  // 及关键字等用户已设的筛选)。返回浅拷贝；找不到则返回 null。
+  function readOrderPageQuery() {
+    const comp = findVueComponent(c => {
+      if (!c || !c.query || typeof c.query !== 'object') return false;
+      for (const m of ['getData', 'getList', 'getTableData']) {
+        if (typeof c[m] === 'function' && /orderList/.test(String(c[m]))) return true;
+      }
+      const q = c.query;
+      return ('user_id' in q) && ('status' in q) && (('type' in q) || ('type_arr' in q));
+    });
+    if (!comp) return null;
+    const out = {};
+    for (const k of Object.keys(comp.query)) {
+      const v = comp.query[k];
+      if (v === undefined || v === null || v === '') continue;
+      if (Array.isArray(v))           out[k] = v.slice();
+      else if (typeof v === 'object') continue;
+      else                            out[k] = v;
+    }
+    return out;
+  }
+
+  function companyNameById(id) {
+    if (id === '' || id == null) return '全部公司';
+    const found = getCompanyList().find(c => String(c.id) === String(id));
+    return found ? (found.company || found.cn_company || ('公司 ' + id)) : ('公司 ' + id);
+  }
+
+  // 统计某一类型在中国时间窗口内的「完成」订单数：沿用页面筛选，强制覆盖
+  // { status:完成, time_type, start, end, 类型字段 }，page/limit 仅取 meta.total。
+  async function countOrders(kind, baseQuery, timeType, chinaStart, chinaEnd) {
+    const params = Object.assign({}, baseQuery);
+    delete params.type; delete params.type_arr; delete params.is_child; // 类型按 kind 重设
+    delete params.page; delete params.limit;
+    Object.assign(params, OC_TYPE[kind], {
+      status:    OC_STATUS_DONE,
+      time_type: timeType,
+      start:     chinaStart,
+      end:       chinaEnd,
+      page:      1,
+      limit:     1,
+    });
+    const resp = await apiGet(API.orderList, params);
+    const total = resp && resp.meta && Number(resp.meta.total);
+    if (Number.isFinite(total)) return total;
+    const arr = resp && resp.data;       // meta 缺失时的兜底
+    return Array.isArray(arr) ? arr.length : 0;
+  }
+
+  async function runOrderCount(panel, kind) {
+    const body    = panel.querySelector('.body');
+    const run     = panel.querySelector('.run');
+    const timeSel = panel.querySelector('.time-select');
+    const crossCb = panel.querySelector('.cross-cb');
+
+    const dr = readPanelDateRange(panel);
+    if (!dr) { flash(body, '请选择有效日期'); return; }
+
+    const base = readOrderPageQuery() || {};
+    flattenParams(base);
+    const companyId    = base.user_id != null ? base.user_id : '';
+    const companyLabel = companyNameById(companyId);
+    const timeType  = timeSel.value;
+    const alsoOther = !!(crossCb && crossCb.checked);
+    const other     = kind === 'doa' ? 'rp' : 'doa';
+
+    run.disabled = true;
+    body.innerHTML = '<div class="loading">查询中…</div>';
+    try {
+      const counts = { doa: null, rp: null };
+      counts[kind] = await countOrders(kind, base, timeType, dr.chinaStart, dr.chinaEnd);
+      if (alsoOther) {
+        counts[other] = await countOrders(other, base, timeType, dr.chinaStart, dr.chinaEnd);
+      }
+      renderOrderCount(body, { dr, companyLabel, timeType, counts });
+    } catch (err) {
+      console.error('[BESENDER 完成统计] 查询失败', err);
+      body.innerHTML = `<div class="error">查询失败：${escapeHtml(err.message || String(err))}</div>`;
+    } finally {
+      run.disabled = false;
+    }
+  }
+
+  function renderOrderCount(container, o) {
+    const tz = localTZ();
+    const timeLabel = o.timeType === OC_TIME_START ? '下单时间' : '完成时间';
+    const rows = [];
+    if (o.counts.doa != null) rows.push(['DOA', o.counts.doa]);
+    if (o.counts.rp  != null) rows.push(['RP（维修）', o.counts.rp]);
+    const showTotal = o.counts.doa != null && o.counts.rp != null;
+    const total = (o.counts.doa || 0) + (o.counts.rp || 0);
+    container.innerHTML = `
+      <div class="hint">
+        <b>${escapeHtml(o.dr.label)}</b>（${escapeHtml(tz)}）→ 中国时间 <b>${escapeHtml(o.dr.chinaStart)}</b> ~ <b>${escapeHtml(o.dr.chinaEnd)}</b><br>
+        公司：<b>${escapeHtml(o.companyLabel)}</b>（沿用页面筛选）｜ 状态：<b>完成</b> ｜ 口径：<b>${escapeHtml(timeLabel)}</b>
+      </div>
+      <table class="summary">
+        <thead><tr><th>类型</th><th style="text-align:right">完成数量</th></tr></thead>
+        <tbody>
+          ${rows.map(r => `<tr><td>${escapeHtml(r[0])}</td><td class="rate">${r[1]}</td></tr>`).join('')}
+          ${showTotal ? `<tr class="total"><td>合计 (DOA+RP)</td><td class="rate">${total}</td></tr>` : ''}
+        </tbody>
+      </table>
+    `;
+  }
+
   // ── Boot ────────────────────────────────────────────────────────────────
 
   function isAggregablePage() {
     const k = pageKind();
-    return k === 'list' || k === 'detail' || k === 'inbound';
+    return k === 'list' || k === 'detail' || k === 'inbound' || k === 'doa' || k === 'rp';
   }
 
   function boot() {
