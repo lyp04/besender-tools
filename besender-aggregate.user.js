@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.8.0
+// @version      1.8.1
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
@@ -1602,8 +1602,30 @@
   };
   const OC_LABEL = { doa: 'DOA', rp: 'RP（维修）' };
 
+  // 中国「今天」(Asia/Shanghai)，作为日期默认值。
+  function chinaTodayStr() {
+    return fmtInTZ(new Date(), SERVER_TZ).slice(0, 10);
+  }
+
+  // 把面板里选的日期当作中国日期直接构造查询窗口(与页面自带筛选一致，不做时区换算)。
+  // 返回 {label, chinaStart, chinaEnd}，均为中国时间 "YYYY-MM-DD HH:mm:ss"。
+  function readPanelChinaDateRange(panel) {
+    const mode = panel.dataset.dateMode || 'single';
+    if (mode === 'single') {
+      const d = panel.querySelector('.date-input').value;
+      if (!d) return null;
+      return { label: d, chinaStart: d + ' 00:00:00', chinaEnd: d + ' 23:59:59' };
+    }
+    const a = panel.querySelector('.date-start').value;
+    const b = panel.querySelector('.date-end').value;
+    if (!a || !b) return null;
+    const start = a <= b ? a : b;
+    const end   = a <= b ? b : a;
+    return { label: `${start} ~ ${end}`, chinaStart: start + ' 00:00:00', chinaEnd: end + ' 23:59:59' };
+  }
+
   function openOrderCountPanel(kind) {
-    const today = localTodayStr();
+    const today = chinaTodayStr();   // 数据按中国时间存储，日期直接按中国日期解释
     const other = kind === 'doa' ? 'rp' : 'doa';
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
@@ -1622,17 +1644,15 @@
             <button class="mode-tab"        data-mode="range"  role="tab">区间</button>
           </div>
           <div class="date-fields single">
-            <label class="date-label">本地日期</label>
+            <label class="date-label">日期（中国）</label>
             <input type="date" class="date-input" value="${today}">
           </div>
           <div class="date-fields range" style="display:none">
-            <label class="date-label">从</label>
+            <label class="date-label">从（中国）</label>
             <input type="date" class="date-start" value="${today}">
             <label class="date-label">到</label>
             <input type="date" class="date-end"   value="${today}">
           </div>
-          <label class="date-label tz-label">时区</label>
-          <select class="tz-select">${buildTzOptionsHtml()}</select>
         </div>
         <div class="footer-actions">
           <label class="date-label">时间口径</label>
@@ -1649,13 +1669,6 @@
       </footer>
     `;
     panel.querySelector('.close').addEventListener('click', () => panel.remove());
-
-    // 时区切换(与其它面板共用行为)。
-    const tzSelect = panel.querySelector('.tz-select');
-    tzSelect.addEventListener('change', () => {
-      setUserTZ(tzSelect.value);
-      relabelDecoratedTimes();
-    });
 
     // 单日 / 区间 切换。
     const tabs   = panel.querySelectorAll('.mode-tab');
@@ -1729,7 +1742,7 @@
     const timeSel = panel.querySelector('.time-select');
     const crossCb = panel.querySelector('.cross-cb');
 
-    const dr = readPanelDateRange(panel);
+    const dr = readPanelChinaDateRange(panel);
     if (!dr) { flash(body, '请选择有效日期'); return; }
 
     const base = readOrderPageQuery() || {};
@@ -1758,7 +1771,6 @@
   }
 
   function renderOrderCount(container, o) {
-    const tz = localTZ();
     const timeLabel = o.timeType === OC_TIME_START ? '下单时间' : '完成时间';
     const rows = [];
     if (o.counts.doa != null) rows.push(['DOA', o.counts.doa]);
@@ -1767,7 +1779,7 @@
     const total = (o.counts.doa || 0) + (o.counts.rp || 0);
     container.innerHTML = `
       <div class="hint">
-        <b>${escapeHtml(o.dr.label)}</b>（${escapeHtml(tz)}）→ 中国时间 <b>${escapeHtml(o.dr.chinaStart)}</b> ~ <b>${escapeHtml(o.dr.chinaEnd)}</b><br>
+        中国时间 <b>${escapeHtml(o.dr.chinaStart)}</b> ~ <b>${escapeHtml(o.dr.chinaEnd)}</b><br>
         公司：<b>${escapeHtml(o.companyLabel)}</b>（沿用页面筛选）｜ 状态：<b>完成</b> ｜ 口径：<b>${escapeHtml(timeLabel)}</b>
       </div>
       <table class="summary">
