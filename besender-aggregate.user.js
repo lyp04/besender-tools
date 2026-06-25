@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.8.2
+// @version      1.8.3
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
@@ -1446,6 +1446,10 @@
   // ── Page-2 timestamp decoration (China time → local + hover tooltip) ────
 
   function decorateTimestamps(scope) {
+    // DOA / 维修(RP) 页面展示的时间本身就是本地时间，不能再按中国时间换算装饰；
+    // 这里直接跳过(兼顾从其它页面 SPA 跳转过来后仍在运行的旧 observer)。
+    const pk = pageKind();
+    if (pk === 'doa' || pk === 'rp') return;
     // Walk text nodes inside scope; wrap any "YYYY-MM-DD HH:mm:ss" in a span.
     // We mark each rewritten parent with data-bsd-decorated so we don't reprocess it.
     const root = scope || document.body;
@@ -1601,6 +1605,23 @@
   };
   const OC_LABEL = { doa: 'DOA', rp: 'RP（维修）' };
 
+  // DOA/RP 的时间是本地时间、与页面自带筛选口径一致，所以日期直接构造
+  // [00:00:00, 23:59:59] 窗口，不做任何时区换算。返回 {label, start, end}。
+  function readOrderDateRange(panel) {
+    const mode = panel.dataset.dateMode || 'single';
+    if (mode === 'single') {
+      const d = panel.querySelector('.date-input').value;
+      if (!d) return null;
+      return { label: d, start: d + ' 00:00:00', end: d + ' 23:59:59' };
+    }
+    const a = panel.querySelector('.date-start').value;
+    const b = panel.querySelector('.date-end').value;
+    if (!a || !b) return null;
+    const s = a <= b ? a : b;
+    const e = a <= b ? b : a;
+    return { label: `${s} ~ ${e}`, start: s + ' 00:00:00', end: e + ' 23:59:59' };
+  }
+
   function openOrderCountPanel(kind) {
     const today = localTodayStr();
     const other = kind === 'doa' ? 'rp' : 'doa';
@@ -1621,7 +1642,7 @@
             <button class="mode-tab"        data-mode="range"  role="tab">区间</button>
           </div>
           <div class="date-fields single">
-            <label class="date-label">本地日期</label>
+            <label class="date-label">日期</label>
             <input type="date" class="date-input" value="${today}">
           </div>
           <div class="date-fields range" style="display:none">
@@ -1630,8 +1651,6 @@
             <label class="date-label">到</label>
             <input type="date" class="date-end"   value="${today}">
           </div>
-          <label class="date-label tz-label">时区</label>
-          <select class="tz-select">${buildTzOptionsHtml()}</select>
         </div>
         <div class="footer-actions">
           <label class="date-label" style="display:flex;align-items:center;gap:4px;cursor:pointer">
@@ -1643,13 +1662,6 @@
       </footer>
     `;
     panel.querySelector('.close').addEventListener('click', () => panel.remove());
-
-    // 时区切换：影响日期换算 + 页面时间显示(与其它面板共用行为)。
-    const tzSelect = panel.querySelector('.tz-select');
-    tzSelect.addEventListener('change', () => {
-      setUserTZ(tzSelect.value);
-      relabelDecoratedTimes();
-    });
 
     // 单日 / 区间 切换。
     const tabs   = panel.querySelectorAll('.mode-tab');
@@ -1698,15 +1710,15 @@
 
   // 统计某一类型在中国时间窗口内的「完成」订单数：沿用页面筛选，强制覆盖
   // { status:完成, time_type, start, end, 类型字段 }，page/limit 仅取 meta.total。
-  async function countOrders(kind, baseQuery, timeType, chinaStart, chinaEnd) {
+  async function countOrders(kind, baseQuery, timeType, winStart, winEnd) {
     const params = Object.assign({}, baseQuery);
     delete params.type; delete params.type_arr; delete params.is_child; // 类型按 kind 重设
     delete params.page; delete params.limit;
     Object.assign(params, OC_TYPE[kind], {
       status:    OC_STATUS_DONE,
       time_type: timeType,
-      start:     chinaStart,
-      end:       chinaEnd,
+      start:     winStart,
+      end:       winEnd,
       page:      1,
       limit:     1,
     });
@@ -1722,7 +1734,7 @@
     const run     = panel.querySelector('.run');
     const crossCb = panel.querySelector('.cross-cb');
 
-    const dr = readPanelDateRange(panel);   // 按所选时区把本地日期换算成中国时间窗口
+    const dr = readOrderDateRange(panel);   // 日期直接用，不做时区换算
     if (!dr) { flash(body, '请选择有效日期'); return; }
 
     const base = readOrderPageQuery() || {};
@@ -1737,9 +1749,9 @@
     body.innerHTML = '<div class="loading">查询中…</div>';
     try {
       const counts = { doa: null, rp: null };
-      counts[kind] = await countOrders(kind, base, timeType, dr.chinaStart, dr.chinaEnd);
+      counts[kind] = await countOrders(kind, base, timeType, dr.start, dr.end);
       if (alsoOther) {
-        counts[other] = await countOrders(other, base, timeType, dr.chinaStart, dr.chinaEnd);
+        counts[other] = await countOrders(other, base, timeType, dr.start, dr.end);
       }
       renderOrderCount(body, { dr, companyLabel, timeType, counts });
     } catch (err) {
@@ -1751,7 +1763,6 @@
   }
 
   function renderOrderCount(container, o) {
-    const tz = localTZ();
     const rows = [];
     if (o.counts.doa != null) rows.push(['DOA', o.counts.doa]);
     if (o.counts.rp  != null) rows.push(['RP（维修）', o.counts.rp]);
@@ -1759,7 +1770,7 @@
     const total = (o.counts.doa || 0) + (o.counts.rp || 0);
     container.innerHTML = `
       <div class="hint">
-        本地日期 <b>${escapeHtml(o.dr.label)}</b>（${escapeHtml(tz)}）→ 中国时间 <b>${escapeHtml(o.dr.chinaStart)}</b> ~ <b>${escapeHtml(o.dr.chinaEnd)}</b><br>
+        日期 <b>${escapeHtml(o.dr.start)}</b> ~ <b>${escapeHtml(o.dr.end)}</b>（按页面本地时间，不换算）<br>
         公司：<b>${escapeHtml(o.companyLabel)}</b>（沿用页面筛选）｜ 状态：<b>完成</b> ｜ 口径：<b>完成时间</b>
       </div>
       <table class="summary">
@@ -1782,9 +1793,13 @@
   function boot() {
     injectStyle();
     if (isAggregablePage()) {
+      const k = pageKind();
       ensureFab();
-      attachTimeTooltip();
-      watchForTimestamps();
+      // 时间换算装饰只用于「中国时间」页面；DOA/RP 的时间已是本地时间，跳过。
+      if (k !== 'doa' && k !== 'rp') {
+        attachTimeTooltip();
+        watchForTimestamps();
+      }
       // Close a stale panel if the user moved between page kinds (e.g. retread → inbound).
       const open = document.getElementById(PANEL_ID);
       if (open && open.dataset.panelKind && open.dataset.panelKind !== pageKind()) {
