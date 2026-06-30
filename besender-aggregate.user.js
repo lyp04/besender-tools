@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.8.3
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。
+// @version      1.8.4
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -57,6 +57,18 @@
     if (/\/engineerDoa(\b|$)/.test(p))                 return 'doa';
     if (/\/engineerRepair(\b|$)/.test(p))              return 'rp';
     return 'other';
+  }
+
+  // Identity under which a panel is retained across SPA inner-tab switches.
+  // Same key ⇒ the same panel (with its results) is restored when the user
+  // returns. Detail pages get a finer key so each model keeps its own panel.
+  function panelKey() {
+    const k = pageKind();
+    if (k === 'detail') {
+      const p = new URLSearchParams(location.search);
+      return 'detail:' + (p.get('warehouse_id') || '') + ':' + (p.get('manage_id') || '');
+    }
+    return k;
   }
 
   // ── Time helpers ────────────────────────────────────────────────────────
@@ -504,13 +516,50 @@
     document.body.appendChild(fab);
   }
 
-  function togglePanel() {
-    const existing = document.getElementById(PANEL_ID);
-    if (existing) {
-      existing.remove();
-      return;
+  // ── Panel persistence ─────────────────────────────────────────────────────
+  //
+  // Panels are kept alive in memory across SPA inner-tab switches so their query
+  // results survive navigation. A panel is discarded only when the user closes it
+  // (✕) or the browser reloads the page (in-memory state is wiped on refresh).
+  // At most one panel is attached to the DOM at a time — the one matching the
+  // current page — so the shared #bsd-agg-panel id (and all its CSS) stays valid;
+  // the rest are detached but retained. Detaching/re-attaching a node preserves
+  // both its rendered content and its event listeners.
+  const livePanels = Object.create(null);
+
+  function registerPanel(panel) {
+    livePanels[panelKey()] = panel;
+  }
+
+  function destroyPanel(panel) {
+    for (const k of Object.keys(livePanels)) {
+      if (livePanels[k] === panel) delete livePanels[k];
     }
-    openPanel();
+    panel.remove();
+  }
+
+  // Attach the panel belonging to the current page (if one was opened earlier)
+  // and detach all others, keeping their references so returning restores them.
+  function syncPanelAttachment() {
+    const key = isAggregablePage() ? panelKey() : null;
+    for (const k of Object.keys(livePanels)) {
+      const el = livePanels[k];
+      if (!el) { delete livePanels[k]; continue; }
+      if (k === key) {
+        if (!el.isConnected) document.body.appendChild(el);
+      } else if (el.isConnected) {
+        el.remove();
+      }
+    }
+  }
+
+  function togglePanel() {
+    if (!isAggregablePage()) return;
+    const key = panelKey();
+    const el  = livePanels[key];
+    if (el && el.isConnected) { destroyPanel(el); return; }  // visible → manual close
+    if (el) { document.body.appendChild(el); return; }       // alive but detached → restore
+    openPanel();                                             // none → build fresh
   }
 
   function openPanel() {
@@ -552,7 +601,7 @@
         </div>
       </footer>
     `;
-    panel.querySelector('.close').addEventListener('click', () => panel.remove());
+    panel.querySelector('.close').addEventListener('click', () => destroyPanel(panel));
 
     // Timezone switcher — affects date interpretation + all decorated timestamps.
     const tzSelect = panel.querySelector('.tz-select');
@@ -580,6 +629,7 @@
     panel.dataset.dateMode = 'single';
 
     document.body.appendChild(panel);
+    registerPanel(panel);
 
     if (kind === 'list')        initListPanel(panel);
     else if (kind === 'detail') initDetailPanel(panel);
@@ -957,12 +1007,13 @@
         </div>
       </footer>
     `;
-    panel.querySelector('.close').addEventListener('click', () => panel.remove());
+    panel.querySelector('.close').addEventListener('click', () => destroyPanel(panel));
     panel.querySelector('.eta-clear').addEventListener('click', () => {
       panel.querySelector('.eta-start').value = '';
       panel.querySelector('.eta-end').value   = '';
     });
     document.body.appendChild(panel);
+    registerPanel(panel);
     initInboundPanel(panel);
   }
 
@@ -1661,7 +1712,7 @@
         </div>
       </footer>
     `;
-    panel.querySelector('.close').addEventListener('click', () => panel.remove());
+    panel.querySelector('.close').addEventListener('click', () => destroyPanel(panel));
 
     // 单日 / 区间 切换。
     const tabs   = panel.querySelectorAll('.mode-tab');
@@ -1677,6 +1728,7 @@
 
     panel.querySelector('.run').addEventListener('click', () => runOrderCount(panel, kind));
     document.body.appendChild(panel);
+    registerPanel(panel);
   }
 
   // 读取当前 engineerDoa / engineerRepair 列表组件的 query(含页面顶部 公司=user_id
@@ -1800,16 +1852,14 @@
         attachTimeTooltip();
         watchForTimestamps();
       }
-      // Close a stale panel if the user moved between page kinds (e.g. retread → inbound).
-      const open = document.getElementById(PANEL_ID);
-      if (open && open.dataset.panelKind && open.dataset.panelKind !== pageKind()) {
-        open.remove();
-      }
     } else {
       // Remove FAB if user navigated away inside the SPA.
       const f = document.getElementById(FAB_ID); if (f) f.remove();
-      const p = document.getElementById(PANEL_ID); if (p) p.remove();
     }
+    // Show this page's panel (if one was opened earlier) and hide the rest.
+    // Panels are retained in memory, so switching SPA tabs no longer drops
+    // results — a panel clears only on manual ✕ close or a full page reload.
+    syncPanelAttachment();
   }
 
   // Vue SPA: route changes don't reload — listen for both popstate and pushState.
