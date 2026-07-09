@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.8.4
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
+// @version      1.9.0
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -351,6 +351,12 @@
       }
       #${PANEL_ID} .expand-btn:hover {
         background: #f0f7ff; color: #2d8cf0; border-color: #2d8cf0;
+      }
+      #${PANEL_ID} td.good .expand-btn {
+        color: #19be6b; font-weight: 600;
+      }
+      #${PANEL_ID} td.good .expand-btn:hover {
+        background: #f0fff5; color: #19be6b; border-color: #19be6b;
       }
       #${PANEL_ID} .expand-btn .caret {
         margin-left: 4px; color: #888; font-size: 10px;
@@ -778,7 +784,7 @@
     const result = panel.querySelector('.result') || panel.querySelector('.body');
     result.innerHTML = `<div class="loading">查询 ${models.length} 个型号 (${escapeHtml(label)}) …</div>`;
 
-    const totals = { good: 0, bad: 0, all: 0 };
+    const totals = { good: 0, bad: 0, all: 0, grades: newGradeTally() };
     const rows = [];
     for (const m of models) {
       try {
@@ -792,7 +798,7 @@
         // errors are e.g. {code: 30006, message: "...", cn_message: "..."} with
         // no `data`. Anything with code != 200 is a failure for that row only.
         if (resp && resp.code && resp.code !== 200) {
-          rows.push({ model: m, good: 0, bad: 0, all: 0,
+          rows.push({ model: m, good: 0, bad: 0, all: 0, grades: newGradeTally(),
                       error: resp.cn_message || resp.message || ('code ' + resp.code) });
           continue;
         }
@@ -802,32 +808,68 @@
         totals.good += c.good;
         totals.bad  += c.bad;
         totals.all  += c.all;
+        addGrades(totals.grades, c.grades);
       } catch (err) {
         console.error('[BESENDER 聚合] 查询失败', m, err);
-        rows.push({ model: m, good: 0, bad: 0, all: 0, error: err.message || String(err) });
+        rows.push({ model: m, good: 0, bad: 0, all: 0, grades: newGradeTally(),
+                    error: err.message || String(err) });
       }
     }
 
     renderSummary(result, rows, label, chinaStart, chinaEnd, totals);
   }
 
-  // A row is 不良品 iff its 翻新结果 field — a template-defined dynamic key
-  // shaped like {sku, name, num} — has an empty `sku`.
-  function isDefective(row) {
-    if (!row || typeof row !== 'object') return false;
+  // The 翻新结果 field is a template-defined dynamic key shaped like
+  // {sku, name, num}. First matching object in the row decides — shared by
+  // the 良品/不良品 judgement and the A/B/C grade bucketing.
+  function resultObjectOf(row) {
+    if (!row || typeof row !== 'object') return null;
     for (const k of Object.keys(row)) {
       const v = row[k];
       if (v && typeof v === 'object' && !Array.isArray(v)
           && 'sku' in v && 'name' in v && 'num' in v) {
-        // First matching result object decides.
-        if (!v.sku) return true;
-        if (typeof v.name === 'string' && /defective/i.test(v.name)) return true;
-        return false;
+        return v;
       }
+    }
+    return null;
+  }
+
+  // A row is 不良品 iff its 翻新结果 object has an empty `sku`.
+  function isDefective(row) {
+    const v = resultObjectOf(row);
+    if (v) {
+      if (!v.sku) return true;
+      if (typeof v.name === 'string' && /defective/i.test(v.name)) return true;
+      return false;
     }
     // Fallback: scan the row JSON for the literal "Defective item" string.
     try { return /\bDefective item\b/.test(JSON.stringify(row)); }
     catch (_) { return false; }
+  }
+
+  // 良品等级：翻新结果名称形如 "T2351黑色A类-九五成" / "…-B类-九成" / "…-C类-五成"。
+  // 捕获等级字母及其成色后缀（若有），如 {grade:'B', label:'B类-九成'}。
+  const GRADE_KEYS = ['A', 'B', 'C'];
+  const GRADE_RE = /([ABCabc])\s*类(?:\s*[-－—]?\s*([一-龥]{1,4}成))?/;
+  function gradeOf(row) {
+    const v = resultObjectOf(row);
+    if (!v || typeof v.name !== 'string') return null;
+    const m = GRADE_RE.exec(v.name);
+    if (!m) return null;
+    const grade = m[1].toUpperCase();
+    return { grade, label: grade + '类' + (m[2] ? '-' + m[2] : '') };
+  }
+
+  function newGradeTally() {
+    // labels: 每个等级第一次见到的完整标签（含成色后缀），用于展示。
+    return { A: 0, B: 0, C: 0, other: 0, labels: {} };
+  }
+  function addGrades(into, from) {
+    for (const g of GRADE_KEYS) into[g] += from[g];
+    into.other += from.other;
+    for (const g of Object.keys(from.labels)) {
+      if (!into.labels[g]) into.labels[g] = from.labels[g];
+    }
   }
 
   function classify(rows) {
@@ -835,16 +877,52 @@
     // entries (status === 3) are data-entry retractions / admin noise — excluded
     // from production totals entirely.
     let good = 0, bad = 0;
+    const grades = newGradeTally();
     for (const r of rows) {
       if (r.status === STATUS_VOID) continue;
-      if (isDefective(r)) bad++; else good++;
+      if (isDefective(r)) { bad++; continue; }
+      good++;
+      const g = gradeOf(r);
+      if (g) {
+        grades[g.grade]++;
+        if (!grades.labels[g.grade]) grades.labels[g.grade] = g.label;
+      } else {
+        grades.other++;
+      }
     }
-    return { good, bad, all: good + bad };
+    return { good, bad, all: good + bad, grades };
   }
 
   function fmtRate(n, d) {
     if (!d) return '—';
     return (n / d * 100).toFixed(1) + '%';
+  }
+
+  // 良品数字 + 下拉小箭头（good = 0 时不给箭头，展开也没内容可看）。
+  // idx 与下方 gradeDetailRowHtml 的 data-parent-idx 配对，复用 onResultClick
+  // 的展开/收起逻辑。
+  function gradeToggleHtml(idx, good) {
+    if (!(good > 0)) return String(good);
+    return `<button type="button" class="expand-btn" data-idx="${idx}" title="展开查看 A/B/C 类明细">${good} <span class="caret">▶</span></button>`;
+  }
+
+  // 展开后显示的 A/B/C 类明细行。A/B/C 恒显示（含 0，便于确认没有产出）；
+  // 名称里无等级标记的良品记为「未标注等级」，仅在 >0 时显示。
+  function gradeDetailRowHtml(idx, grades, good, colspan) {
+    const g = grades || newGradeTally();
+    const line = (lab, n) =>
+      `<tr><td>${escapeHtml(lab)}</td><td class="good">${n}</td><td class="rate">${fmtRate(n, good)}</td></tr>`;
+    const lines = GRADE_KEYS.map(k => line(g.labels[k] || (k + '类'), g[k])).join('')
+      + (g.other > 0 ? line('未标注等级', g.other) : '');
+    return `
+      <tr class="detail-row" data-parent-idx="${idx}" style="display:none">
+        <td colspan="${colspan}">
+          <table class="sub-table">
+            <thead><tr><th>良品等级</th><th>数量</th><th>占良品</th></tr></thead>
+            <tbody>${lines}</tbody>
+          </table>
+        </td>
+      </tr>`;
   }
 
   function renderSummary(container, rows, label, chinaStart, chinaEnd, totals) {
@@ -871,40 +949,47 @@
     container.innerHTML = `
       <div class="hint">
         本地 <b>${escapeHtml(label)}</b> (${escapeHtml(tz)}) 对应中国时间窗口：
-        <b>${escapeHtml(chinaStart)}</b> ~ <b>${escapeHtml(chinaEnd)}</b>
+        <b>${escapeHtml(chinaStart)}</b> ~ <b>${escapeHtml(chinaEnd)}</b><br>
+        点「良品」数字旁的 ▶ 展开 A/B/C 类明细。
       </div>
       <table class="summary">
         <thead>
           <tr>
             <th>SKU</th><th>型号</th>
-            <th title="翻新结果可用，非 Defective">良品</th>
+            <th title="翻新结果可用，非 Defective。点数字展开 A/B/C 类明细">良品</th>
             <th title="翻新结果为 Defective item — 即报废件">不良品</th>
             <th title="良品 + 不良品（不含工作流作废的录入）">总和</th>
             <th title="不良品 / 总和">报废率</th>
           </tr>
         </thead>
         <tbody>
-          ${visibleRows.map(r => `
+          ${visibleRows.map((r, i) => `
             <tr${r.error ? ' class="err-row"' : ''}>
               <td>${escapeHtml(r.model.sku)}</td>
               <td title="${escapeHtml(r.model.productName || '')}">${escapeHtml(r.model.model || r.model.productName || r.model.sku)}</td>
-              <td class="good">${r.good}</td>
+              <td class="good">${gradeToggleHtml(i, r.good)}</td>
               <td class="bad">${r.bad}</td>
               <td>${r.all}${r.error ? ' <span class="err-tag" title="' + escapeHtml(r.error) + '">⚠</span>' : ''}</td>
               <td class="rate">${fmtRate(r.bad, r.all)}</td>
             </tr>
+            ${r.good > 0 ? gradeDetailRowHtml(i, r.grades, r.good, 6) : ''}
           `).join('')}
           <tr class="total">
             <td colspan="2">合计 (${hiddenCount > 0 ? `${visibleRows.length} 有产出 / 共 ${rows.length}` : `${visibleRows.length} 个型号`})</td>
-            <td class="good">${totals.good}</td>
+            <td class="good">${gradeToggleHtml('total', totals.good)}</td>
             <td class="bad">${totals.bad}</td>
             <td>${totals.all}</td>
             <td class="rate">${fmtRate(totals.bad, totals.all)}</td>
           </tr>
+          ${totals.good > 0 ? gradeDetailRowHtml('total', totals.grades, totals.good, 6) : ''}
         </tbody>
       </table>
       ${errorRows.length ? `<div class="error" style="margin-top:8px">${errorRows.length} 个型号查询失败（鼠标放在 ⚠ 上看原因）</div>` : ''}
     `;
+
+    // 展开/收起用与头程入库面板相同的 onResultClick（具名函数，重复
+    // addEventListener 会被 DOM 去重，不会叠加触发）。
+    container.addEventListener('click', onResultClick);
   }
 
   // ── Detail page (page 2) panel ──────────────────────────────────────────
