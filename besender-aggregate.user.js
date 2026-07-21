@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.9.0
+// @version      1.9.1
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
@@ -196,6 +196,14 @@
     const tz = localTZ();
     const now = new Date();
     return fmtInTZ(now, tz).slice(0, 10);
+  }
+
+  // DOA/RP pages already display and filter timestamps in the browser's local
+  // timezone. Their default date must therefore ignore the timezone persisted
+  // by the other (China-time) statistics panels. Otherwise, a user who selected
+  // Asia/Shanghai there can open DOA/RP in America and default to tomorrow.
+  function pageLocalTodayStr() {
+    return fmtInTZ(new Date(), systemTZ()).slice(0, 10);
   }
 
   // Shift a local-calendar date "YYYY-MM-DD" by `days` and return the new
@@ -1726,8 +1734,8 @@
   // ── DOA / 维修(RP) 完成订单统计 ─────────────────────────────────────────
   //
   // engineerDoa 与 engineerRepair 列表页共用 /engineer/afterSale/orderList。
-  // 面板按本地日期(单日/区间, 受时区选择器影响)换算出中国时间窗口，统计「完成」
-  // 状态订单数量；公司及关键字等条件沿用页面顶部自带的搜索筛选(读取其 query)。
+  // 面板按页面本地日期（单日/区间）直接构造查询窗口，统计「完成」状态订单数量；
+  // 公司及关键字等条件沿用页面顶部自带的搜索筛选（读取其 query）。
   // DOA 页可勾选「同时统计 RP」、RP 页可勾选「同时统计 DOA」，给出 DOA+RP 合计。
 
   // 订单工作流状态：'1' 进行中 / '2' 完成。本功能始终统计「完成」。
@@ -1759,7 +1767,7 @@
   }
 
   function openOrderCountPanel(kind) {
-    const today = localTodayStr();
+    const today = pageLocalTodayStr();
     const other = kind === 'doa' ? 'rp' : 'doa';
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
@@ -1845,11 +1853,14 @@
     return found ? (found.company || found.cn_company || ('公司 ' + id)) : ('公司 ' + id);
   }
 
-  // 统计某一类型在中国时间窗口内的「完成」订单数：沿用页面筛选，强制覆盖
+  // 统计某一类型在页面本地时间窗口内的「完成」订单数：沿用页面筛选，强制覆盖
   // { status:完成, time_type, start, end, 类型字段 }，page/limit 仅取 meta.total。
   async function countOrders(kind, baseQuery, timeType, winStart, winEnd) {
     const params = Object.assign({}, baseQuery);
     delete params.type; delete params.type_arr; delete params.is_child; // 类型按 kind 重设
+    // service_type is an RP-only filter. Carrying it into a cross-page DOA
+    // request can silently filter every DOA order out.
+    if (kind === 'doa') delete params.service_type;
     delete params.page; delete params.limit;
     Object.assign(params, OC_TYPE[kind], {
       status:    OC_STATUS_DONE,
@@ -1860,10 +1871,20 @@
       limit:     1,
     });
     const resp = await apiGet(API.orderList, params);
-    const total = resp && resp.meta && Number(resp.meta.total);
-    if (Number.isFinite(total)) return total;
-    const arr = resp && resp.data;       // meta 缺失时的兜底
-    return Array.isArray(arr) ? arr.length : 0;
+    if (!resp || typeof resp !== 'object') {
+      throw new Error('统计接口返回为空');
+    }
+    if (resp.code != null && Number(resp.code) !== 200) {
+      throw new Error(resp.cn_message || resp.message || ('统计接口错误（code ' + resp.code + '）'));
+    }
+    const rawTotal = resp.meta && resp.meta.total;
+    const total = Number(rawTotal);
+    if (rawTotal !== undefined && rawTotal !== null && rawTotal !== ''
+        && Number.isFinite(total) && total >= 0) return total;
+    // This request deliberately uses limit=1, so data.length cannot represent
+    // the total when pagination metadata is missing. Fail visibly instead of
+    // reporting a plausible but incorrect 0 or 1.
+    throw new Error('统计接口缺少有效的 meta.total');
   }
 
   async function runOrderCount(panel, kind) {
@@ -1874,7 +1895,11 @@
     const dr = readOrderDateRange(panel);   // 日期直接用，不做时区换算
     if (!dr) { flash(body, '请选择有效日期'); return; }
 
-    const base = readOrderPageQuery() || {};
+    const base = readOrderPageQuery();
+    if (!base) {
+      flash(body, '未找到页面筛选条件，请等列表加载完成后重试');
+      return;
+    }
     flattenParams(base);
     const companyId    = base.user_id != null ? base.user_id : '';
     const companyLabel = companyNameById(companyId);
@@ -1947,22 +1972,40 @@
     syncPanelAttachment();
   }
 
-  // Vue SPA: route changes don't reload — listen for both popstate and pushState.
-  ;(function patchHistory(){
+  // Vue SPA: route changes don't reload. Some production router builds retain
+  // History methods before this userscript patches them, so History hooks alone
+  // miss inner-tab switches (for example DOA → RP). Keep the hooks for immediate
+  // updates and add a cheap location watcher as a reliable fallback.
+  ;(function watchRoutes(){
     if (window.__bsdAggPatched) return;
     window.__bsdAggPatched = true;
+    let lastRoute = location.pathname + location.search + location.hash;
+    let pending = null;
+
+    function scheduleBootIfChanged() {
+      const nextRoute = location.pathname + location.search + location.hash;
+      if (nextRoute === lastRoute) return;
+      lastRoute = nextRoute;
+      if (pending) clearTimeout(pending);
+      pending = setTimeout(() => {
+        pending = null;
+        boot();
+      }, 150);
+    }
+
     for (const k of ['pushState', 'replaceState']) {
       const orig = history[k];
       history[k] = function () {
         const r = orig.apply(this, arguments);
-        window.dispatchEvent(new Event('bsd-route'));
+        scheduleBootIfChanged();
         return r;
       };
     }
-    window.addEventListener('popstate', () => window.dispatchEvent(new Event('bsd-route')));
+    window.addEventListener('popstate', scheduleBootIfChanged);
+    window.addEventListener('hashchange', scheduleBootIfChanged);
+    setInterval(scheduleBootIfChanged, 250);
   })();
 
-  window.addEventListener('bsd-route', () => setTimeout(boot, 300));
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', boot);
   } else {
