@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.10.1
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；工程师订单的 DOA/RP 页保留完成统计，售后服务维修页按公司和本地日期统计新订单、进行中、已完成及良品/不良品占比。中国时间可切换为本地时区显示，悬停显示原文。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
+// @version      1.10.2
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；工程师订单的 DOA/RP 页保留完成统计，售后服务维修页按公司和本地日期统计新订单、进行中、已完成及良品/不良品占比，多选公司时缩进显示各公司明细。中国时间可切换为本地时区显示，悬停显示原文。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -386,6 +386,20 @@
       #${PANEL_ID} table.summary td.rate  { color: #515a6e; font-weight: 600; text-align: right; }
       #${PANEL_ID} table.summary td.good  { color: #19be6b; font-weight: 600; }
       #${PANEL_ID} table.summary td.bad   { color: #ed4014; font-weight: 600; }
+      #${PANEL_ID} .company-details { margin-top: 10px; }
+      #${PANEL_ID} .company-details-title { color: #515a6e; font-size: 12px; font-weight: 700; margin-bottom: 6px; }
+      #${PANEL_ID} .company-detail {
+        margin: 0 0 6px 14px; padding: 7px 9px;
+        border-left: 2px solid #d9e8ff; background: #fafbfc; border-radius: 0 4px 4px 0;
+      }
+      #${PANEL_ID} .company-detail-name { color: #2d8cf0; font-size: 12px; font-weight: 700; margin-bottom: 5px; }
+      #${PANEL_ID} .company-detail-metrics {
+        display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px 8px;
+        color: #606266; font-size: 11.5px;
+      }
+      #${PANEL_ID} .company-detail-metrics b { color: #17233d; }
+      #${PANEL_ID} .company-detail-metrics .good b { color: #19be6b; }
+      #${PANEL_ID} .company-detail-metrics .bad b { color: #ed4014; }
       #${PANEL_ID} .err-tag { color: #ed4014; cursor: help; margin-left: 4px; }
 
       #${PANEL_ID} .empty    { color: #999;    padding: 12px; text-align: center; }
@@ -2103,20 +2117,82 @@
 
   // ── 售后服务 → 维修服务订单统计 (/single/rp) ──────────────────────────
   //
-  // 该页面与上面的工程师 RP 是两个独立模块，使用不同接口和状态定义：
-  //   新订单 status=1，按创建时间 time_type=3；
-  //   进行中 status=2，按开始时间 time_type=1；
-  //   已完成 status=3，按完成时间 time_type=2；
+  // 该页面与上面的工程师 RP 是两个独立模块，使用不同接口和时间字段：
+  //   新订单按创建时间 time_type=3；
+  //   进行中按开始时间 time_type=1；
+  //   已完成按完成时间 time_type=2；
   //   良品/不良品使用 is_perfect=1/0。
+  // 这些是流程事件统计，不能再叠加当前 status；否则订单后来进入下一状态
+  // （尤其完成后已出库）时会从历史统计中消失。
   // 页面展示的是中国墙钟时间，统计日期始终按用户明确选择的时区解释，默认美西。
 
-  const ASR_STATUS_NEW = '1';
-  const ASR_STATUS_PROGRESS = '2';
-  const ASR_STATUS_DONE = '3';
   const ASR_TIME_START = '1';
   const ASR_TIME_COMPLETION = '2';
   const ASR_TIME_CREATED = '3';
   const ASR_TYPE_ARR = '1,2';
+  const ASR_COMPANY_CONCURRENCY = 2;
+
+  // user_id may be a number, an array from the page's multi-select, or a CSV
+  // string after flattenParams(). Return unique string IDs in selection order.
+  // null means the value is unsafe/ambiguous and must fail closed.
+  function parseAfterSaleRepairCompanyIds(value) {
+    if (value === undefined || value === null || value === '') return [];
+    const source = Array.isArray(value) ? value : [value];
+    const ids = [];
+    const seen = new Set();
+    for (const item of source) {
+      let tokens;
+      if (typeof item === 'number') {
+        if (!Number.isSafeInteger(item) || item <= 0) return null;
+        tokens = [String(item)];
+      } else if (typeof item === 'string') {
+        tokens = item.split(',');
+      } else {
+        return null;
+      }
+      for (const token of tokens) {
+        const id = token.trim();
+        // Only an explicitly empty top-level value means "all companies".
+        // A non-empty CSV/array containing empty tokens is ambiguous and must
+        // never silently widen into an all-company query.
+        if (!id) return null;
+        if (!/^\d+$/.test(id)) return null;
+        const canonicalId = id.replace(/^0+(?=\d)/, '');
+        if (canonicalId === '0') return null;
+        if (!seen.has(canonicalId)) {
+          seen.add(canonicalId);
+          ids.push(canonicalId);
+        }
+      }
+    }
+    return ids;
+  }
+
+  async function mapAfterSaleCompaniesWithLimit(companyIds, worker) {
+    const results = new Array(companyIds.length);
+    let next = 0;
+    async function runWorker() {
+      while (next < companyIds.length) {
+        const index = next++;
+        results[index] = await worker(companyIds[index], index);
+      }
+    }
+    const workers = Math.min(ASR_COMPANY_CONCURRENCY, companyIds.length);
+    await Promise.all(Array.from({ length: workers }, () => runWorker()));
+    return results;
+  }
+
+  function sumAfterSaleRepairStats(companyDetails) {
+    return companyDetails.reduce((sum, detail) => {
+      const stats = detail.stats;
+      sum.newOrders += stats.newOrders;
+      sum.inProgress += stats.inProgress;
+      sum.done += stats.done;
+      sum.positive += stats.positive;
+      sum.negative += stats.negative;
+      return sum;
+    }, { newOrders: 0, inProgress: 0, done: 0, positive: 0, negative: 0 });
+  }
 
   function readAfterSaleRepairDateRange(panel) {
     const mode = panel.dataset.dateMode || 'single';
@@ -2150,7 +2226,8 @@
       </header>
       <div class="body"><div class="empty">
         选择日期后点「查询」。公司及其余条件沿用页面顶部筛选；
-        新订单按创建时间，进行中按开始时间，已完成按完成时间。
+        新订单按创建时间，进行中按开始时间，已完成按完成时间，
+        不受订单之后流转到其它状态影响。
       </div></div>
       <footer>
         <div class="date-controls">
@@ -2225,6 +2302,8 @@
     const visible = candidates.filter(isVisibleVueComponent);
     const comp = visible.length === 1 ? visible[0] : null;
     if (!comp) return null;
+    // Never turn an unreadable multi-select value into an all-company request.
+    if (parseAfterSaleRepairCompanyIds(comp.query.user_id) === null) return null;
     const out = {};
     for (const k of Object.keys(comp.query)) {
       const v = comp.query[k];
@@ -2250,7 +2329,6 @@
     delete params.limit;
     Object.assign(params, {
       type_arr: ASR_TYPE_ARR,
-      status: o.status,
       time_type: o.timeType,
       start: o.start,
       end: o.end,
@@ -2273,19 +2351,16 @@
     throw new Error('统计接口缺少有效的 meta.total');
   }
 
-  async function countAfterSaleRepairStats(baseQuery, winStart, winEnd) {
+  async function countAfterSaleRepairMetricSet(baseQuery, winStart, winEnd) {
     const window = { start: winStart, end: winEnd };
     const completed = Object.assign({}, window, {
-      status: ASR_STATUS_DONE,
       timeType: ASR_TIME_COMPLETION,
     });
     const [newOrders, inProgress, done, positive, negative] = await Promise.all([
       countAfterSaleRepairOrders(baseQuery, Object.assign({}, window, {
-        status: ASR_STATUS_NEW,
         timeType: ASR_TIME_CREATED,
       })),
       countAfterSaleRepairOrders(baseQuery, Object.assign({}, window, {
-        status: ASR_STATUS_PROGRESS,
         timeType: ASR_TIME_START,
       })),
       countAfterSaleRepairOrders(baseQuery, completed),
@@ -2296,6 +2371,39 @@
       throw new Error('统计接口返回的良品/不良品分类数量不一致');
     }
     return { newOrders, inProgress, done, positive, negative };
+  }
+
+  async function countAfterSaleRepairStats(baseQuery, winStart, winEnd) {
+    const companyIds = parseAfterSaleRepairCompanyIds(baseQuery && baseQuery.user_id);
+    if (companyIds === null) {
+      throw new Error('公司选择格式无效，请刷新页面后重新选择公司');
+    }
+
+    // All companies or a single company keeps the original five-request path.
+    if (companyIds.length <= 1) {
+      const query = Object.assign({}, baseQuery);
+      if (companyIds.length === 0) {
+        delete query.user_id;
+      } else if (typeof query.user_id !== 'number') {
+        query.user_id = companyIds[0];
+      }
+      return countAfterSaleRepairMetricSet(query, winStart, winEnd);
+    }
+
+    // A multi-company total is derived from its per-company rows. This both
+    // avoids five extra API calls and guarantees the displayed total reconciles
+    // with the detail rows even while orders are changing during the query.
+    const companyDetails = await mapAfterSaleCompaniesWithLimit(companyIds, async userId => {
+      const companyLabel = companyNameById(userId);
+      const query = Object.assign({}, baseQuery, { user_id: userId });
+      try {
+        const stats = await countAfterSaleRepairMetricSet(query, winStart, winEnd);
+        return { userId, companyLabel, stats };
+      } catch (err) {
+        throw new Error(`${companyLabel} 查询失败：${err.message || String(err)}`);
+      }
+    });
+    return Object.assign(sumAfterSaleRepairStats(companyDetails), { companyDetails });
   }
 
   async function runAfterSaleRepairCount(panel) {
@@ -2309,9 +2417,15 @@
       flash(body, '未找到售后维修页面筛选条件，请等列表加载完成后重试');
       return;
     }
+    const companyIds = parseAfterSaleRepairCompanyIds(base.user_id);
+    if (companyIds === null) {
+      flash(body, '公司选择格式无效，请刷新页面后重新选择公司');
+      return;
+    }
     flattenParams(base);
-    const companyId = base.user_id != null ? base.user_id : '';
-    const companyLabel = companyNameById(companyId);
+    const companyLabel = companyIds.length > 1
+      ? `已选 ${companyIds.length} 家公司`
+      : companyNameById(companyIds.length === 1 ? companyIds[0] : '');
 
     run.disabled = true;
     body.innerHTML = '<div class="loading">查询中…</div>';
@@ -2328,6 +2442,7 @@
 
   function renderAfterSaleRepairCount(container, o) {
     const stats = o.stats;
+    const companyDetails = Array.isArray(stats.companyDetails) ? stats.companyDetails : [];
     const unclassified = Math.max(0, stats.done - stats.positive - stats.negative);
     const metricRow = (label, count, rate = null, cls = '') => `
       <tr${cls === 'total' ? ' class="total"' : ''}>
@@ -2335,6 +2450,24 @@
         <td class="rate${cls === 'good' || cls === 'bad' ? ` ${cls}` : ''}">${count}</td>
         <td class="rate${cls === 'good' || cls === 'bad' ? ` ${cls}` : ''}">${rate == null ? '—' : rate}</td>
       </tr>`;
+    const companyDetailHtml = companyDetails.map(detail => {
+      const s = detail.stats;
+      const detailUnclassified = Math.max(0, s.done - s.positive - s.negative);
+      return `
+        <div class="company-detail">
+          <div class="company-detail-name">↳ ${escapeHtml(detail.companyLabel)}</div>
+          <div class="company-detail-metrics">
+            <span>新订单 <b>${s.newOrders}</b></span>
+            <span>进行中 <b>${s.inProgress}</b></span>
+            <span>已完成 <b>${s.done}</b></span>
+            <span class="good">良品 <b>${s.positive}（${fmtRate(s.positive, s.done)}）</b></span>
+            <span class="bad">不良品 <b>${s.negative}（${fmtRate(s.negative, s.done)}）</b></span>
+            ${detailUnclassified
+              ? `<span>未分类 <b>${detailUnclassified}（${fmtRate(detailUnclassified, s.done)}）</b></span>`
+              : ''}
+          </div>
+        </div>`;
+    }).join('');
 
     container.innerHTML = `
       <div class="hint">
@@ -2342,7 +2475,8 @@
         （${escapeHtml(o.dr.timezone)}）<br>
         中国查询窗口 <b>${escapeHtml(o.dr.chinaStart)}</b> ~ <b>${escapeHtml(o.dr.chinaEnd)}</b><br>
         公司：<b>${escapeHtml(o.companyLabel)}</b>（沿用售后维修页面筛选）<br>
-        口径：<b>新订单按创建时间；进行中按开始时间；已完成按完成时间</b>
+        口径：<b>新订单按创建时间；进行中按开始时间；已完成按完成时间</b><br>
+        各项按流程事件统计，不受订单之后的当前状态影响（已出库仍计入完成）。
       </div>
       <table class="summary">
         <thead><tr><th>指标</th><th style="text-align:right">数量</th><th style="text-align:right">占已完成</th></tr></thead>
@@ -2355,6 +2489,11 @@
           ${unclassified ? metricRow('未分类', unclassified, fmtRate(unclassified, stats.done)) : ''}
         </tbody>
       </table>
+      ${companyDetails.length ? `
+        <div class="company-details">
+          <div class="company-details-title">公司明细（总计由以下公司相加）</div>
+          ${companyDetailHtml}
+        </div>` : ''}
     `;
   }
 

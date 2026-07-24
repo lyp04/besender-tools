@@ -9,11 +9,18 @@ const vm = require('node:vm');
 const sourcePath = path.join(__dirname, '..', 'besender-aggregate.user.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 
-function loadHooks({ response = null, responses = null, rootVue = null, pathname = '/bsd-warehouse/engineerRepair' } = {}) {
+function loadHooks({
+  response = null,
+  responses = null,
+  rootVue = null,
+  pathname = '/bsd-warehouse/engineerRepair',
+  apiHandler = null,
+} = {}) {
   const apiStub = `  async function apiGet(path, params) {
     globalThis.__lastApiCall = { path, params };
     globalThis.__apiCalls = globalThis.__apiCalls || [];
     globalThis.__apiCalls.push({ path, params });
+    if (globalThis.__apiHandler) return globalThis.__apiHandler(path, params);
     return globalThis.__apiResponses ? globalThis.__apiResponses.shift() : globalThis.__apiResponse;
   }
 
@@ -45,6 +52,7 @@ function loadHooks({ response = null, responses = null, rootVue = null, pathname
     openOrderCountPanel,
     countOrders,
     countOrderStats,
+    parseAfterSaleRepairCompanyIds,
     countAfterSaleRepairStats,
     readOrderPageQuery,
     readAfterSaleRepairPageQuery,
@@ -88,6 +96,7 @@ ${bootMarker}`,
     Intl: { DateTimeFormat: MockDateTimeFormat },
     __apiResponse: response,
     __apiResponses: responses ? responses.slice() : null,
+    __apiHandler: apiHandler,
     document: {
       querySelector: (selector) => selector === '#app' && rootVue ? { __vue__: rootVue } : null,
     },
@@ -556,7 +565,28 @@ test('engineer repair keeps the v1.9.4 three completed-result requests in page-l
   assert.match(body.innerHTML, /完成数量/);
 });
 
-test('after-sale repair stats query five metrics with their real status and time semantics', async () => {
+test('after-sale repair parses selected company ids from arrays and comma strings', () => {
+  const context = loadHooks({ pathname: '/bsd-warehouse/single/rp' });
+
+  assert.deepEqual(
+    Array.from(context.__testHooks.parseAfterSaleRepairCompanyIds([7, '119', 7, ' 119 '])),
+    ['7', '119'],
+  );
+  assert.deepEqual(
+    Array.from(context.__testHooks.parseAfterSaleRepairCompanyIds('7, 119, 7')),
+    ['7', '119'],
+  );
+  assert.deepEqual(
+    Array.from(context.__testHooks.parseAfterSaleRepairCompanyIds(7)),
+    ['7'],
+  );
+  assert.deepEqual(
+    Array.from(context.__testHooks.parseAfterSaleRepairCompanyIds([7, '007'])),
+    ['7'],
+  );
+});
+
+test('after-sale repair stats query five event-time metrics without current-status filters', async () => {
   const context = loadHooks({
     pathname: '/bsd-warehouse/single/rp',
     responses: [
@@ -572,7 +602,7 @@ test('after-sale repair stats query five metrics with their real status and time
 
   const stats = await context.__testHooks.countAfterSaleRepairStats(
     {
-      user_id: 119,
+      user_id: [119],
       type_arr: '1,2',
       keyword: 'phone',
       status: '9',
@@ -595,32 +625,29 @@ test('after-sale repair stats query five metrics with their real status and time
     positive: 7,
     negative: 3,
   });
+  assert.equal('companyDetails' in stats, false);
   assert.equal(context.__apiCalls.length, 5);
 
   const calls = context.__apiCalls.map(call => call.params);
-  assert.equal(calls[0].status, '1');
   assert.equal(calls[0].time_type, '3');
   assert.equal('is_perfect' in calls[0], false);
 
-  assert.equal(calls[1].status, '2');
   assert.equal(calls[1].time_type, '1');
   assert.equal('is_perfect' in calls[1], false);
 
-  assert.equal(calls[2].status, '3');
   assert.equal(calls[2].time_type, '2');
   assert.equal('is_perfect' in calls[2], false);
 
-  assert.equal(calls[3].status, '3');
   assert.equal(calls[3].time_type, '2');
   assert.equal(calls[3].is_perfect, 1);
 
-  assert.equal(calls[4].status, '3');
   assert.equal(calls[4].time_type, '2');
   assert.equal(calls[4].is_perfect, 0);
 
   context.__apiCalls.forEach(({ path, params }) => {
     assert.equal(path, '/warehouse/afterSale/orderList');
-    assert.equal(params.user_id, 119);
+    assert.equal('status' in params, false);
+    assert.equal(String(params.user_id), '119');
     assert.equal(params.keyword, 'phone');
     assert.equal(params.type_arr, '1,2');
     assert.equal(params.start, start);
@@ -629,6 +656,277 @@ test('after-sale repair stats query five metrics with their real status and time
     assert.equal(params.limit, 1);
     assert.equal('perfect_num' in params, false);
   });
+});
+
+test('after-sale repair removes a stale current status so later-shipped orders remain eligible', async () => {
+  const totals = {
+    '3/all': 4,
+    '1/all': 2,
+    '2/all': 3,
+    '2/1': 2,
+    '2/0': 1,
+  };
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    apiHandler(_path, params) {
+      // A later-shipped order would be excluded if the stale page status leaked
+      // into any of these historical event-time requests.
+      if ('status' in params) return { code: 200, data: [], meta: { total: 0 } };
+      const signature = `${params.time_type}/${params.is_perfect == null ? 'all' : params.is_perfect}`;
+      return { code: 200, data: [], meta: { total: totals[signature] } };
+    },
+  });
+
+  const stats = await context.__testHooks.countAfterSaleRepairStats(
+    { user_id: 119, type_arr: '1,2', status: '4' },
+    '2026-07-01 15:00:00',
+    '2026-07-02 14:59:59',
+  );
+
+  assert.deepEqual({ ...stats }, {
+    newOrders: 4,
+    inProgress: 2,
+    done: 3,
+    positive: 2,
+    negative: 1,
+  });
+  assert.equal(context.__apiCalls.length, 5);
+  assert.deepEqual(
+    Array.from(context.__apiCalls, ({ params }) =>
+      `${params.time_type}/${params.is_perfect == null ? 'all' : params.is_perfect}`),
+    ['3/all', '1/all', '2/all', '2/1', '2/0'],
+  );
+  context.__apiCalls.forEach(({ params }) => assert.equal('status' in params, false));
+});
+
+test('multi-company after-sale repair makes only five requests per company and sums their totals', async () => {
+  const totals = (newOrders, inProgress, done, positive, negative) => [
+    newOrders, inProgress, done, positive, negative,
+  ].map(total => ({ code: 200, data: [{}], meta: { total } }));
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    responses: [
+      ...totals(12, 4, 8, 6, 2),
+      ...totals(18, 5, 13, 9, 4),
+    ],
+  });
+  const start = '2026-07-01 15:00:00';
+  const end = '2026-07-02 14:59:59';
+
+  const stats = await context.__testHooks.countAfterSaleRepairStats(
+    { user_id: [7, 119], type_arr: '1,2', keyword: 'phone' },
+    start,
+    end,
+  );
+
+  assert.equal(context.__apiCalls.length, 10);
+  assert.deepEqual({
+    newOrders: stats.newOrders,
+    inProgress: stats.inProgress,
+    done: stats.done,
+    positive: stats.positive,
+    negative: stats.negative,
+  }, { newOrders: 30, inProgress: 9, done: 21, positive: 15, negative: 6 });
+  assert.deepEqual(Array.from(stats.companyDetails, detail => ({
+    userId: String(detail.userId),
+    companyLabel: detail.companyLabel,
+    stats: { ...detail.stats },
+  })), [
+    {
+      userId: '7',
+      companyLabel: '公司 7',
+      stats: { newOrders: 12, inProgress: 4, done: 8, positive: 6, negative: 2 },
+    },
+    {
+      userId: '119',
+      companyLabel: '公司 119',
+      stats: { newOrders: 18, inProgress: 5, done: 13, positive: 9, negative: 4 },
+    },
+  ]);
+
+  const calls = Array.from(context.__apiCalls, call => call.params);
+  assert.equal(calls.filter(params => String(params.user_id) === '7').length, 5);
+  assert.equal(calls.filter(params => String(params.user_id) === '119').length, 5);
+  for (const params of calls) {
+    assert.equal(Array.isArray(params.user_id), false);
+    assert.doesNotMatch(String(params.user_id), /,/);
+    assert.equal('status' in params, false);
+  }
+
+  const expectedSignatures = ['3/all', '1/all', '2/all', '2/1', '2/0'];
+  for (let offset = 0; offset < calls.length; offset += 5) {
+    const signatures = calls.slice(offset, offset + 5).map(params =>
+      `${params.time_type}/${params.is_perfect == null ? 'all' : params.is_perfect}`
+    );
+    assert.deepEqual(signatures, expectedSignatures);
+  }
+});
+
+test('comma-separated after-sale repair company ids also expand into per-company requests', async () => {
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    responses: Array.from({ length: 10 }, () => ({
+      code: 200, data: [], meta: { total: 0 },
+    })),
+  });
+
+  const stats = await context.__testHooks.countAfterSaleRepairStats(
+    { user_id: '7,119,7', type_arr: '1,2' },
+    '2026-07-01 15:00:00',
+    '2026-07-02 14:59:59',
+  );
+
+  assert.equal(context.__apiCalls.length, 10);
+  assert.equal(stats.companyDetails.length, 2);
+  const detailIds = Array.from(context.__apiCalls, call => String(call.params.user_id));
+  assert.equal(detailIds.filter(id => id === '7').length, 5);
+  assert.equal(detailIds.filter(id => id === '119').length, 5);
+});
+
+test('invalid after-sale repair company tokens fail closed before any API request', async () => {
+  const context = loadHooks({ pathname: '/bsd-warehouse/single/rp' });
+
+  await assert.rejects(
+    context.__testHooks.countAfterSaleRepairStats(
+      { user_id: '7,not-a-company,119', type_arr: '1,2' },
+      '2026-07-01 15:00:00',
+      '2026-07-02 14:59:59',
+    ),
+    /公司.*(无效|格式|选择)|user_id/i,
+  );
+  assert.equal(context.__apiCalls, undefined);
+});
+
+test('nonempty after-sale repair CSV with an empty token fails closed', async () => {
+  const context = loadHooks({ pathname: '/bsd-warehouse/single/rp' });
+
+  await assert.rejects(
+    context.__testHooks.countAfterSaleRepairStats(
+      { user_id: '7,,119', type_arr: '1,2' },
+      '2026-07-01 15:00:00',
+      '2026-07-02 14:59:59',
+    ),
+    /公司.*(无效|格式|选择)|user_id/i,
+  );
+  assert.equal(context.__apiCalls, undefined);
+});
+
+test('zero-valued after-sale repair company ids fail closed before any API request', async () => {
+  for (const userId of [0, '000']) {
+    const context = loadHooks({ pathname: '/bsd-warehouse/single/rp' });
+    await assert.rejects(
+      context.__testHooks.countAfterSaleRepairStats(
+        { user_id: userId, type_arr: '1,2' },
+        '2026-07-01 15:00:00',
+        '2026-07-02 14:59:59',
+      ),
+      /公司.*(无效|格式|选择)|user_id/i,
+    );
+    assert.equal(context.__apiCalls, undefined);
+  }
+});
+
+test('explicitly empty after-sale repair user_id keeps the five-request all-company path', async () => {
+  const totals = [8, 3, 5, 4, 1];
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    responses: totals.map(total => ({ code: 200, data: [], meta: { total } })),
+  });
+
+  const stats = await context.__testHooks.countAfterSaleRepairStats(
+    { user_id: '', type_arr: '1,2', status: 'stale' },
+    '2026-07-01 15:00:00',
+    '2026-07-02 14:59:59',
+  );
+
+  assert.deepEqual({ ...stats }, {
+    newOrders: 8,
+    inProgress: 3,
+    done: 5,
+    positive: 4,
+    negative: 1,
+  });
+  assert.equal(context.__apiCalls.length, 5);
+  context.__apiCalls.forEach(({ params }) => {
+    assert.equal('user_id' in params, false);
+    assert.equal('status' in params, false);
+  });
+});
+
+test('after-sale repair limits per-company statistics to two companies at a time', async () => {
+  const pendingByCompany = new Map();
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    apiHandler(_path, params) {
+      const id = String(params.user_id);
+      return new Promise(resolve => {
+        const pending = pendingByCompany.get(id) || [];
+        pending.push(() => resolve({
+          code: 200,
+          data: [],
+          meta: { total: params.time_type === '2' && params.is_perfect == null ? 2 : 1 },
+        }));
+        pendingByCompany.set(id, pending);
+      });
+    },
+  });
+  const flush = () => new Promise(resolve => setImmediate(resolve));
+  const resolveCompany = (id) => {
+    const pending = pendingByCompany.get(String(id)) || [];
+    assert.equal(pending.length, 5);
+    pending.forEach(resolve => resolve());
+  };
+
+  const statsPromise = context.__testHooks.countAfterSaleRepairStats(
+    { user_id: [1, 2, 3, 4], type_arr: '1,2' },
+    '2026-07-01 15:00:00',
+    '2026-07-02 14:59:59',
+  );
+  await flush();
+  assert.deepEqual(Array.from(pendingByCompany.keys()), ['1', '2']);
+  assert.equal(context.__apiCalls.length, 10);
+
+  resolveCompany(1);
+  await flush();
+  assert.deepEqual(Array.from(pendingByCompany.keys()), ['1', '2', '3']);
+  assert.equal(pendingByCompany.has('4'), false);
+
+  resolveCompany(2);
+  await flush();
+  assert.deepEqual(Array.from(pendingByCompany.keys()), ['1', '2', '3', '4']);
+
+  resolveCompany(3);
+  resolveCompany(4);
+  const stats = await statsPromise;
+  assert.equal(stats.companyDetails.length, 4);
+  assert.deepEqual({
+    newOrders: stats.newOrders,
+    inProgress: stats.inProgress,
+    done: stats.done,
+    positive: stats.positive,
+    negative: stats.negative,
+  }, { newOrders: 4, inProgress: 4, done: 8, positive: 4, negative: 4 });
+});
+
+test('after-sale repair reports the company when one company detail request fails', async () => {
+  const ok = total => ({ code: 200, data: [], meta: { total } });
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    responses: [
+      ok(12), ok(4), ok(8), ok(6), ok(2),
+      { code: 30006, cn_message: '会话已失效' }, ok(5), ok(13), ok(9), ok(4),
+    ],
+  });
+
+  await assert.rejects(
+    context.__testHooks.countAfterSaleRepairStats(
+      { user_id: [7, 119], type_arr: '1,2' },
+      '2026-07-01 15:00:00',
+      '2026-07-02 14:59:59',
+    ),
+    /公司.*119.*(失败|会话已失效)/,
+  );
+  assert.equal(context.__apiCalls.length, 10);
 });
 
 test('order stats render positive and negative counts, percentages, and totals', () => {
@@ -683,6 +981,62 @@ test('after-sale repair renders new, in-progress, completed, good, and bad metri
   assert.match(container.innerHTML, /不良品/);
   assert.match(container.innerHTML, /良品[\s\S]*?<td class="rate good">7<\/td>[\s\S]*?<td class="rate good">70\.0%<\/td>/);
   assert.match(container.innerHTML, /不良品[\s\S]*?<td class="rate bad">3<\/td>[\s\S]*?<td class="rate bad">30\.0%<\/td>/);
+  assert.doesNotMatch(container.innerHTML, /company-detail|公司明细/);
+});
+
+test('after-sale repair renders indented five-metric detail for each selected company', () => {
+  const context = loadHooks({ pathname: '/bsd-warehouse/single/rp' });
+  const container = { innerHTML: '' };
+
+  context.__testHooks.renderAfterSaleRepairCount(container, {
+    dr: {
+      timezone: 'America/Los_Angeles',
+      localStart: '2026-07-01 00:00:00',
+      localEnd: '2026-07-01 23:59:59',
+      chinaStart: '2026-07-01 15:00:00',
+      chinaEnd: '2026-07-02 14:59:59',
+    },
+    companyLabel: 'Anker、Nothing',
+    stats: {
+      newOrders: 30,
+      inProgress: 9,
+      done: 21,
+      positive: 15,
+      negative: 6,
+      companyDetails: [
+        {
+          userId: '7',
+          companyLabel: 'Anker',
+          stats: { newOrders: 12, inProgress: 4, done: 8, positive: 6, negative: 2 },
+        },
+        {
+          userId: '119',
+          companyLabel: 'Nothing',
+          stats: { newOrders: 18, inProgress: 5, done: 13, positive: 9, negative: 4 },
+        },
+      ],
+    },
+  });
+
+  assert.equal((container.innerHTML.match(/class="company-detail"/g) || []).length, 2);
+  assert.equal((container.innerHTML.match(/↳\s*Anker/g) || []).length, 1);
+  assert.equal((container.innerHTML.match(/↳\s*Nothing/g) || []).length, 1);
+
+  const ankerAt = container.innerHTML.indexOf('↳ Anker');
+  const nothingAt = container.innerHTML.indexOf('↳ Nothing');
+  assert.ok(ankerAt >= 0 && nothingAt > ankerAt);
+  const anker = container.innerHTML.slice(ankerAt, nothingAt);
+  const nothing = container.innerHTML.slice(nothingAt);
+  assert.match(anker, /新订单\s*<b>12<\/b>/);
+  assert.match(anker, /进行中\s*<b>4<\/b>/);
+  assert.match(anker, /已完成\s*<b>8<\/b>/);
+  assert.match(anker, /良品\s*<b>6（75\.0%）<\/b>/);
+  assert.match(anker, /不良品\s*<b>2（25\.0%）<\/b>/);
+  assert.match(nothing, /新订单\s*<b>18<\/b>/);
+  assert.match(nothing, /进行中\s*<b>5<\/b>/);
+  assert.match(nothing, /已完成\s*<b>13<\/b>/);
+  assert.match(nothing, /良品\s*<b>9（69\.2%）<\/b>/);
+  assert.match(nothing, /不良品\s*<b>4（30\.8%）<\/b>/);
 });
 
 test('after-sale repair shows unavailable good and bad rates when no orders completed', () => {
