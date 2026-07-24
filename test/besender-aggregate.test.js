@@ -256,6 +256,7 @@ test('order stats render positive and negative counts, percentages, and totals',
   const container = { innerHTML: '' };
 
   context.__testHooks.renderOrderCount(container, {
+    kind: 'doa',
     dr: { start: '2026-07-01 00:00:00', end: '2026-07-01 23:59:59' },
     companyLabel: 'Nothing',
     counts: {
@@ -273,11 +274,43 @@ test('order stats render positive and negative counts, percentages, and totals',
   assert.match(container.innerHTML, /合计 \(DOA\+RP\)/);
 });
 
+test('order stats use page-native labels and add parenthetical labels only for cross-counts', () => {
+  const context = loadHooks();
+  const stats = { done: 10, positive: 7, negative: 3 };
+  const base = {
+    dr: { start: '2026-07-01 00:00:00', end: '2026-07-01 23:59:59' },
+    companyLabel: 'Nothing',
+  };
+  const rpOnly = { innerHTML: '' };
+  const doaOnly = { innerHTML: '' };
+  const rpCross = { innerHTML: '' };
+
+  context.__testHooks.renderOrderCount(rpOnly, {
+    ...base, kind: 'rp', counts: { doa: null, rp: stats },
+  });
+  context.__testHooks.renderOrderCount(doaOnly, {
+    ...base, kind: 'doa', counts: { doa: stats, rp: null },
+  });
+  context.__testHooks.renderOrderCount(rpCross, {
+    ...base, kind: 'rp', counts: { doa: stats, rp: stats },
+  });
+
+  assert.match(rpOnly.innerHTML, /<th[^>]*>良品<\/th>/);
+  assert.match(rpOnly.innerHTML, /<th[^>]*>不良品<\/th>/);
+  assert.doesNotMatch(rpOnly.innerHTML, /良品（通过）|不良品（不通过）/);
+  assert.match(doaOnly.innerHTML, /<th[^>]*>通过<\/th>/);
+  assert.match(doaOnly.innerHTML, /<th[^>]*>不通过<\/th>/);
+  assert.doesNotMatch(doaOnly.innerHTML, /通过（良品）|不通过（不良品）/);
+  assert.match(rpCross.innerHTML, /良品（通过）/);
+  assert.match(rpCross.innerHTML, /不良品（不通过）/);
+});
+
 test('order stats show an em dash percentage when completed count is zero', () => {
   const context = loadHooks();
   const container = { innerHTML: '' };
 
   context.__testHooks.renderOrderCount(container, {
+    kind: 'rp',
     dr: { start: '2026-07-01 00:00:00', end: '2026-07-01 23:59:59' },
     companyLabel: 'Nothing',
     counts: { doa: null, rp: { done: 0, positive: 0, negative: 0 } },

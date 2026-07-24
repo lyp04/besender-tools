@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.9.3
+// @version      1.9.4
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量及通过(良品)/不通过(不良品)数量与占比(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
@@ -1983,7 +1983,7 @@
       if (alsoOther) {
         counts[other] = await countOrderStats(other, base, timeType, dr.start, dr.end);
       }
-      renderOrderCount(body, { dr, companyLabel, timeType, counts });
+      renderOrderCount(body, { kind, dr, companyLabel, timeType, counts });
     } catch (err) {
       console.error('[BESENDER 完成统计] 查询失败', err);
       body.innerHTML = `<div class="error">查询失败：${escapeHtml(err.message || String(err))}</div>`;
@@ -1997,6 +1997,13 @@
     if (o.counts.doa != null) rows.push(['DOA', o.counts.doa]);
     if (o.counts.rp  != null) rows.push(['RP（维修）', o.counts.rp]);
     const showTotal = o.counts.doa != null && o.counts.rp != null;
+    const primaryKind = o.kind === 'doa' ? 'doa' : 'rp';
+    const positiveLabel = primaryKind === 'doa'
+      ? (showTotal ? '通过（良品）' : '通过')
+      : (showTotal ? '良品（通过）' : '良品');
+    const negativeLabel = primaryKind === 'doa'
+      ? (showTotal ? '不通过（不良品）' : '不通过')
+      : (showTotal ? '不良品（不通过）' : '不良品');
     const total = rows.reduce((sum, r) => ({
       done:     sum.done     + r[1].done,
       positive: sum.positive + r[1].positive,
@@ -2019,8 +2026,8 @@
       <table class="summary">
         <thead><tr>
           <th>类型</th>
-          <th style="text-align:right">通过（良品）</th>
-          <th style="text-align:right">不通过（不良品）</th>
+          <th style="text-align:right">${positiveLabel}</th>
+          <th style="text-align:right">${negativeLabel}</th>
           <th style="text-align:right">完成数量</th>
         </tr></thead>
         <tbody>
