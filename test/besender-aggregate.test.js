@@ -29,20 +29,27 @@ function loadHooks({ response = null, responses = null, rootVue = null, pathname
   instrumented = instrumented.replace(
     bootMarker,
     `  globalThis.__testHooks = {
+    pageKind,
+    isAggregablePage,
+    fabLabelFor,
     localTodayStr,
     pageLocalTodayStr,
-    orderStatsTZ,
+    afterSaleRepairStatsTZ,
     zonedDateRangeToChinaWindow,
-    orderWindowForKind,
     relabelDecoratedTimes,
+    decorateTimestamps,
     textHasTimestamp,
     isVisibleTimestampParent,
     watchForTimestamps,
+    readOrderDateRange,
+    openOrderCountPanel,
     countOrders,
     countOrderStats,
-    countRepairStats,
+    countAfterSaleRepairStats,
     readOrderPageQuery,
+    readAfterSaleRepairPageQuery,
     renderOrderCount,
+    renderAfterSaleRepairCount,
     runOrderCount,
   };
   return;
@@ -97,7 +104,7 @@ ${bootMarker}`,
   return context;
 }
 
-function loadRouteHarness() {
+function loadRouteHarness({ initialPath = '/bsd-warehouse/engineerDoa' } = {}) {
   const bootStub = `  function boot() {
     globalThis.__bootKinds.push(pageKind());
   }
@@ -110,7 +117,7 @@ function loadRouteHarness() {
   assert.notEqual(instrumented, source, 'boot test seam must be installed');
 
   const location = {
-    pathname: '/bsd-warehouse/engineerDoa',
+    pathname: initialPath,
     search: '',
     hash: '',
   };
@@ -157,13 +164,13 @@ function loadRouteHarness() {
   return { context, pollRoute: () => pollRoute(), retainedRouterPush, timers };
 }
 
-test('repair stats default to Los Angeles independently of the timezone saved by other panels', () => {
+test('after-sale repair stats default to Los Angeles independently of other panel timezones', () => {
   const context = loadHooks();
 
   // At this instant it is July 21 in Los Angeles and July 22 in Shanghai.
   assert.equal(context.__testHooks.localTodayStr(), '2026-07-22');
   assert.equal(context.__testHooks.pageLocalTodayStr(), '2026-07-21');
-  assert.equal(context.__testHooks.orderStatsTZ(), 'America/Los_Angeles');
+  assert.equal(context.__testHooks.afterSaleRepairStatsTZ(), 'America/Los_Angeles');
 });
 
 test('Los Angeles summer day converts to the matching China-time query window', () => {
@@ -251,33 +258,22 @@ test('timezone switching can use China wall time and normalizes reversed ranges'
   });
 });
 
-test('cross-counts derive separate RP China and DOA page-local windows', () => {
+test('engineer repair keeps the v1.9.4 page-local date window without timezone conversion', () => {
   const context = loadHooks();
-  const selectedDay = {
-    timezone: 'America/Los_Angeles',
-    localStart: '2026-07-01 00:00:00',
-    localEnd: '2026-07-01 23:59:59',
-    start: '2026-07-01 15:00:00',
-    end: '2026-07-02 14:59:59',
+  const panel = {
+    dataset: { panelKind: 'rp', dateMode: 'single' },
+    querySelector(selector) {
+      if (selector === '.date-input') return { value: '2026-07-01' };
+      if (selector === '.tz-select') assert.fail('engineer repair must not read a timezone selector');
+      return null;
+    },
   };
 
-  assert.deepEqual({ ...context.__testHooks.orderWindowForKind(selectedDay, 'rp') }, {
-    start: '2026-07-01 15:00:00',
-    end: '2026-07-02 14:59:59',
-  });
-  assert.deepEqual({ ...context.__testHooks.orderWindowForKind(selectedDay, 'doa') }, {
+  const range = context.__testHooks.readOrderDateRange(panel);
+  assert.equal(range.label, '2026-07-01');
+  assert.deepEqual({ start: range.start, end: range.end }, {
     start: '2026-07-01 00:00:00',
     end: '2026-07-01 23:59:59',
-  });
-
-  const chinaDay = {
-    timezone: 'Asia/Shanghai',
-    localStart: '2026-07-01 00:00:00',
-    localEnd: '2026-07-01 23:59:59',
-  };
-  assert.deepEqual({ ...context.__testHooks.orderWindowForKind(chinaDay, 'doa') }, {
-    start: '2026-06-30 09:00:00',
-    end: '2026-07-01 08:59:59',
   });
 });
 
@@ -315,7 +311,7 @@ test('timestamp discovery skips hidden keep-alive pages and resets its global re
 });
 
 test('timestamp observer is singleton and debounces multiple mutation batches without dropping the last', () => {
-  const context = loadHooks();
+  const context = loadHooks({ pathname: '/bsd-warehouse/single/rp' });
   let observerCallback = null;
   let observeCount = 0;
   let walkCount = 0;
@@ -347,6 +343,63 @@ test('timestamp observer is singleton and debounces multiple mutation batches wi
   assert.equal(walkCount, 3);
 });
 
+test('engineer repair and after-sale repair have distinct routes and button labels', () => {
+  const engineer = loadHooks({ pathname: '/bsd-warehouse/engineerRepair' });
+  const afterSale = loadHooks({ pathname: '/bsd-warehouse/single/rp' });
+
+  assert.equal(engineer.__testHooks.pageKind(), 'rp');
+  assert.equal(engineer.__testHooks.isAggregablePage(), true);
+  assert.equal(engineer.__testHooks.fabLabelFor('rp'), '📊 RP 完成统计');
+  assert.equal(afterSale.__testHooks.pageKind(), 'afterSaleRepair');
+  assert.equal(afterSale.__testHooks.isAggregablePage(), true);
+  assert.match(afterSale.__testHooks.fabLabelFor('afterSaleRepair'), /维修.*统计/);
+});
+
+test('engineer repair keeps the v1.9.4 completed-only panel without a timezone selector', () => {
+  const context = loadHooks({ pathname: '/bsd-warehouse/engineerRepair' });
+  const eventTarget = { addEventListener() {} };
+  const single = { style: {} };
+  const range = { style: {} };
+  const panel = {
+    dataset: {},
+    innerHTML: '',
+    isConnected: true,
+    remove() {},
+    querySelector(selector) {
+      if (selector === '.close' || selector === '.run') return eventTarget;
+      if (selector === '.date-fields.single') return single;
+      if (selector === '.date-fields.range') return range;
+      if (selector === '.tz-select') assert.fail('engineer repair panel must not query .tz-select');
+      return null;
+    },
+    querySelectorAll(selector) {
+      return selector === '.mode-tab' ? [] : [];
+    },
+  };
+  context.document.createElement = () => panel;
+  context.document.body = { appendChild() {} };
+
+  context.__testHooks.openOrderCountPanel('rp');
+
+  assert.match(panel.innerHTML, /RP（维修） 完成统计/);
+  assert.doesNotMatch(panel.innerHTML, /tz-select|时区|新订单|进行中/);
+  assert.match(panel.innerHTML, /同时统计 RP（维修）|同时统计 DOA/);
+});
+
+test('engineer repair timestamps remain page-local and are not decorated', () => {
+  const context = loadHooks({ pathname: '/bsd-warehouse/engineerRepair' });
+  let walkerCalls = 0;
+  context.NodeFilter = { SHOW_TEXT: 4, FILTER_REJECT: 2, FILTER_ACCEPT: 1 };
+  context.document.createTreeWalker = () => {
+    walkerCalls += 1;
+    return { nextNode: () => false };
+  };
+
+  context.__testHooks.decorateTimestamps({ nodeType: 1 });
+
+  assert.equal(walkerCalls, 0);
+});
+
 test('route polling catches inner-tab switches that bypass patched History methods', () => {
   const harness = loadRouteHarness();
   assert.deepEqual(Array.from(harness.context.__bootKinds), ['doa']);
@@ -360,6 +413,18 @@ test('route polling catches inner-tab switches that bypass patched History metho
   assert.deepEqual(Array.from(harness.context.__bootKinds), ['doa', 'rp']);
 });
 
+test('route polling recognizes after-sale repair without replacing engineer repair kind', () => {
+  const harness = loadRouteHarness({ initialPath: '/bsd-warehouse/engineerRepair' });
+  assert.deepEqual(Array.from(harness.context.__bootKinds), ['rp']);
+
+  harness.retainedRouterPush(null, '', '/bsd-warehouse/single/rp');
+  harness.pollRoute();
+  assert.equal(harness.timers.length, 1);
+  harness.timers[0]();
+
+  assert.deepEqual(Array.from(harness.context.__bootKinds), ['rp', 'afterSaleRepair']);
+});
+
 test('order counts use meta.total and remove RP-only filters from DOA', async () => {
   const context = loadHooks({ response: { code: 200, data: [{}], meta: { total: '42' } } });
 
@@ -369,13 +434,9 @@ test('order counts use meta.total and remove RP-only filters from DOA', async ()
       page: 9, limit: 10, type_arr: '1,2', is_child: 0, service_type: 'mail',
       user_id: 7, perfect_num: 1, un_perfect_num: 1,
     },
-    {
-      status: '2',
-      timeType: '2',
-      start: '2026-07-01 00:00:00',
-      end: '2026-07-01 23:59:59',
-      perfectNum: null,
-    },
+    '2',
+    '2026-07-01 00:00:00',
+    '2026-07-01 23:59:59',
   );
 
   assert.equal(total, 42);
@@ -398,13 +459,10 @@ test('order result counts preserve perfect_num zero and all page filters', async
   const total = await context.__testHooks.countOrders(
     'rp',
     { user_id: 119, keyword: 'phone', perfect_num: 1 },
-    {
-      status: '2',
-      timeType: '2',
-      start: '2026-07-01 00:00:00',
-      end: '2026-07-01 23:59:59',
-      perfectNum: 0,
-    },
+    '2',
+    '2026-07-01 00:00:00',
+    '2026-07-01 23:59:59',
+    0,
   );
 
   assert.equal(total, 3);
@@ -448,27 +506,81 @@ test('order stats reject classification totals larger than completed orders', as
   );
 });
 
-test('repair stats query new, in-progress, completed, good, and bad orders with distinct scopes', async () => {
-  const context = loadHooks({ responses: [
+test('engineer repair keeps the v1.9.4 three completed-result requests in page-local time', async () => {
+  const visibleEl = { nodeType: 1, isConnected: true, getClientRects: () => [{}] };
+  const rootVue = {
+    $children: [{
+      query: { type_arr: '1,2', is_child: 0, status: '1', user_id: 7 },
+      getData() { return this._loadOrders(); },
+      $el: visibleEl,
+    }],
+  };
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/engineerRepair',
+    rootVue,
+    responses: [
+      { code: 200, data: [{}], meta: { total: 10 } },
+      { code: 200, data: [{}], meta: { total: 7 } },
+      { code: 200, data: [{}], meta: { total: 3 } },
+    ],
+  });
+  const body = { innerHTML: '' };
+  const run = { disabled: false };
+  const panel = {
+    dataset: { panelKind: 'rp', dateMode: 'single' },
+    querySelector(selector) {
+      if (selector === '.body') return body;
+      if (selector === '.run') return run;
+      if (selector === '.cross-cb') return { checked: false };
+      if (selector === '.date-input') return { value: '2026-07-01' };
+      if (selector === '.tz-select') assert.fail('engineer repair must not use a timezone selector');
+      return null;
+    },
+  };
+
+  await context.__testHooks.runOrderCount(panel, 'rp');
+
+  assert.equal(context.__apiCalls.length, 3);
+  assert.deepEqual(Array.from(context.__apiCalls, call => call.params.perfect_num), [undefined, 1, 0]);
+  for (const call of context.__apiCalls) {
+    assert.equal(call.path, '/engineer/afterSale/orderList');
+    assert.equal(call.params.type_arr, '1,2');
+    assert.equal(call.params.is_child, 0);
+    assert.equal(call.params.user_id, 7);
+    assert.equal(call.params.status, '2');
+    assert.equal(call.params.time_type, '2');
+    assert.equal(call.params.start, '2026-07-01 00:00:00');
+    assert.equal(call.params.end, '2026-07-01 23:59:59');
+  }
+  assert.doesNotMatch(body.innerHTML, /新订单|进行中|时区/);
+  assert.match(body.innerHTML, /完成数量/);
+});
+
+test('after-sale repair stats query five metrics with their real status and time semantics', async () => {
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    responses: [
     { code: 200, data: [{}], meta: { total: 18 } },
     { code: 200, data: [{}], meta: { total: 5 } },
     { code: 200, data: [{}], meta: { total: 10 } },
     { code: 200, data: [{}], meta: { total: 7 } },
     { code: 200, data: [{}], meta: { total: 3 } },
-  ] });
+    ],
+  });
   const start = '2026-07-01 15:00:00';
   const end = '2026-07-02 14:59:59';
 
-  const stats = await context.__testHooks.countRepairStats(
+  const stats = await context.__testHooks.countAfterSaleRepairStats(
     {
       user_id: 119,
+      type_arr: '1,2',
       keyword: 'phone',
       status: '9',
       time_type: '9',
       start: 'stale start',
       end: 'stale end',
+      is_perfect: 1,
       perfect_num: 1,
-      un_perfect_num: 1,
       page: 9,
       limit: 10,
     },
@@ -486,37 +598,37 @@ test('repair stats query new, in-progress, completed, good, and bad orders with 
   assert.equal(context.__apiCalls.length, 5);
 
   const calls = context.__apiCalls.map(call => call.params);
-  assert.equal('status' in calls[0], false);
-  assert.equal(calls[0].time_type, '1');
-  assert.equal('perfect_num' in calls[0], false);
+  assert.equal(calls[0].status, '1');
+  assert.equal(calls[0].time_type, '3');
+  assert.equal('is_perfect' in calls[0], false);
 
-  assert.equal(calls[1].status, '1');
+  assert.equal(calls[1].status, '2');
   assert.equal(calls[1].time_type, '1');
-  assert.equal('perfect_num' in calls[1], false);
+  assert.equal('is_perfect' in calls[1], false);
 
-  assert.equal(calls[2].status, '2');
+  assert.equal(calls[2].status, '3');
   assert.equal(calls[2].time_type, '2');
-  assert.equal('perfect_num' in calls[2], false);
+  assert.equal('is_perfect' in calls[2], false);
 
-  assert.equal(calls[3].status, '2');
+  assert.equal(calls[3].status, '3');
   assert.equal(calls[3].time_type, '2');
-  assert.equal(calls[3].perfect_num, 1);
+  assert.equal(calls[3].is_perfect, 1);
 
-  assert.equal(calls[4].status, '2');
+  assert.equal(calls[4].status, '3');
   assert.equal(calls[4].time_type, '2');
-  assert.equal(calls[4].perfect_num, 0);
+  assert.equal(calls[4].is_perfect, 0);
 
-  for (const params of calls) {
+  context.__apiCalls.forEach(({ path, params }) => {
+    assert.equal(path, '/warehouse/afterSale/orderList');
     assert.equal(params.user_id, 119);
     assert.equal(params.keyword, 'phone');
     assert.equal(params.type_arr, '1,2');
-    assert.equal(params.is_child, 0);
     assert.equal(params.start, start);
     assert.equal(params.end, end);
     assert.equal(params.page, 1);
     assert.equal(params.limit, 1);
-    assert.equal('un_perfect_num' in params, false);
-  }
+    assert.equal('perfect_num' in params, false);
+  });
 });
 
 test('order stats render positive and negative counts, percentages, and totals', () => {
@@ -542,12 +654,11 @@ test('order stats render positive and negative counts, percentages, and totals',
   assert.match(container.innerHTML, /合计 \(DOA\+RP\)/);
 });
 
-test('RP repair stats render new, in-progress, completed, good, and bad metrics', () => {
-  const context = loadHooks();
+test('after-sale repair renders new, in-progress, completed, good, and bad metrics', () => {
+  const context = loadHooks({ pathname: '/bsd-warehouse/single/rp' });
   const container = { innerHTML: '' };
 
-  context.__testHooks.renderOrderCount(container, {
-    kind: 'rp',
+  context.__testHooks.renderAfterSaleRepairCount(container, {
     dr: {
       label: '2026-07-01',
       timezone: 'America/Los_Angeles',
@@ -559,27 +670,26 @@ test('RP repair stats render new, in-progress, completed, good, and bad metrics'
       chinaEnd: '2026-07-02 14:59:59',
     },
     companyLabel: 'Nothing',
-    counts: {
-      doa: null,
-      rp: { newOrders: 18, inProgress: 5, done: 10, positive: 7, negative: 3 },
-    },
+    stats: { newOrders: 18, inProgress: 5, done: 10, positive: 7, negative: 3 },
   });
 
   assert.match(container.innerHTML, /新订单[\s\S]*18/);
   assert.match(container.innerHTML, /进行中[\s\S]*5/);
   assert.match(container.innerHTML, /已完成[\s\S]*10/);
+  assert.match(container.innerHTML, /新订单[^<]*创建时间|新订单[\s\S]*创建时间/);
+  assert.match(container.innerHTML, /进行中[^<]*开始时间|进行中[\s\S]*开始时间/);
+  assert.match(container.innerHTML, /已完成[^<]*完成时间|已完成[\s\S]*完成时间/);
   assert.match(container.innerHTML, /良品/);
   assert.match(container.innerHTML, /不良品/);
   assert.match(container.innerHTML, /良品[\s\S]*?<td class="rate good">7<\/td>[\s\S]*?<td class="rate good">70\.0%<\/td>/);
   assert.match(container.innerHTML, /不良品[\s\S]*?<td class="rate bad">3<\/td>[\s\S]*?<td class="rate bad">30\.0%<\/td>/);
 });
 
-test('RP repair stats show unavailable good and bad rates when no orders completed', () => {
-  const context = loadHooks();
+test('after-sale repair shows unavailable good and bad rates when no orders completed', () => {
+  const context = loadHooks({ pathname: '/bsd-warehouse/single/rp' });
   const container = { innerHTML: '' };
 
-  context.__testHooks.renderOrderCount(container, {
-    kind: 'rp',
+  context.__testHooks.renderAfterSaleRepairCount(container, {
     dr: {
       timezone: 'America/Los_Angeles',
       localStart: '2026-07-01 00:00:00',
@@ -588,10 +698,7 @@ test('RP repair stats show unavailable good and bad rates when no orders complet
       end: '2026-07-02 14:59:59',
     },
     companyLabel: 'Nothing',
-    counts: {
-      doa: null,
-      rp: { newOrders: 0, inProgress: 0, done: 0, positive: 0, negative: 0 },
-    },
+    stats: { newOrders: 0, inProgress: 0, done: 0, positive: 0, negative: 0 },
   });
 
   assert.match(container.innerHTML, /良品[\s\S]*?<td class="rate good">0<\/td>[\s\S]*?<td class="rate good">—<\/td>/);
@@ -674,13 +781,7 @@ test('RP order count inherits the company from the visible RP filter component',
 
   const query = context.__testHooks.readOrderPageQuery('rp');
   const total = await context.__testHooks.countOrders(
-    'rp', query, {
-      status: '2',
-      timeType: '2',
-      start: '2026-07-01 00:00:00',
-      end: '2026-07-01 23:59:59',
-      perfectNum: null,
-    },
+    'rp', query, '2', '2026-07-01 00:00:00', '2026-07-01 23:59:59',
   );
 
   assert.equal(total, 3);
@@ -688,6 +789,86 @@ test('RP order count inherits the company from the visible RP filter component',
   assert.equal(query.type_arr, '1,2');
   assert.equal('type' in query, false);
   assert.equal(context.__lastApiCall.params.user_id, 7);
+});
+
+test('after-sale repair inherits the selected company from its visible page component', () => {
+  const hiddenEl = { nodeType: 1, isConnected: true, getClientRects: () => [] };
+  const visibleEl = { nodeType: 1, isConnected: true, getClientRects: () => [{}] };
+  const rootVue = {
+    $children: [
+      {
+        query: { type_arr: '1,2', is_child: 0, status: '1', user_id: 88 },
+        getData() { return '/engineer/afterSale/orderList'; },
+        $el: visibleEl,
+      },
+      {
+        query: {
+          user_id: '', type_arr: '1,2', status: '', is_perfect: '', time_type: '',
+        },
+        $options: { name: 'order_rp' },
+        getData() { return '/warehouse/afterSale/orderList'; },
+        $el: hiddenEl,
+      },
+      {
+        query: {
+          user_id: 119, type_arr: '1,2', status: '2', is_perfect: 0, time_type: '1',
+          keyword: 'phone',
+        },
+        $options: { name: 'order_rp' },
+        // Production wrappers need not retain the endpoint in Function#toString().
+        getData() { return this._loadOrders(); },
+        $el: visibleEl,
+      },
+    ],
+  };
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    rootVue,
+  });
+
+  const query = context.__testHooks.readAfterSaleRepairPageQuery();
+
+  assert.deepEqual({ ...query }, {
+    user_id: 119,
+    type_arr: '1,2',
+    status: '2',
+    is_perfect: 0,
+    time_type: '1',
+    keyword: 'phone',
+  });
+});
+
+test('after-sale repair query fails closed when company state is missing, hidden, or ambiguous', () => {
+  const visibleEl = { nodeType: 1, isConnected: true, getClientRects: () => [{}] };
+  const hiddenEl = { nodeType: 1, isConnected: true, getClientRects: () => [] };
+  const makeComponent = (userId, el = visibleEl, includeUser = true) => {
+    const query = { type_arr: '1,2', status: '1', is_perfect: '', time_type: '3' };
+    if (includeUser) query.user_id = userId;
+    return {
+      query,
+      $options: { name: 'order_rp' },
+      getData() { return this._loadOrders(); },
+      $el: el,
+    };
+  };
+
+  const missingCompany = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    rootVue: { $children: [makeComponent(null, visibleEl, false)] },
+  });
+  assert.equal(missingCompany.__testHooks.readAfterSaleRepairPageQuery(), null);
+
+  const hiddenOnly = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    rootVue: { $children: [makeComponent(119, hiddenEl)] },
+  });
+  assert.equal(hiddenOnly.__testHooks.readAfterSaleRepairPageQuery(), null);
+
+  const ambiguous = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    rootVue: { $children: [makeComponent(119), makeComponent(120)] },
+  });
+  assert.equal(ambiguous.__testHooks.readAfterSaleRepairPageQuery(), null);
 });
 
 test('order query refuses to silently count all companies when user_id cannot be read', () => {
@@ -725,7 +906,6 @@ test('hidden cached order query cannot fall back to an all-company request', asy
       if (selector === '.run') return { disabled: false };
       if (selector === '.cross-cb') return { checked: false };
       if (selector === '.date-input') return { value: '2026-07-01' };
-      if (selector === '.tz-select') return { value: 'America/Los_Angeles' };
       return null;
     },
   };
@@ -755,13 +935,9 @@ test('order counts surface business errors instead of reporting zero', async () 
   const context = loadHooks({ response: { code: 30006, cn_message: '会话已失效' } });
 
   await assert.rejects(
-    context.__testHooks.countOrders('rp', {}, {
-      status: '2',
-      timeType: '2',
-      start: '2026-07-01 00:00:00',
-      end: '2026-07-01 23:59:59',
-      perfectNum: null,
-    }),
+    context.__testHooks.countOrders(
+      'rp', {}, '2', '2026-07-01 00:00:00', '2026-07-01 23:59:59',
+    ),
     /会话已失效/,
   );
 });
@@ -770,25 +946,51 @@ test('order counts reject responses without pagination totals', async () => {
   const context = loadHooks({ response: { code: 200, data: [{}] } });
 
   await assert.rejects(
-    context.__testHooks.countOrders('rp', {}, {
-      status: '2',
-      timeType: '2',
-      start: '2026-07-01 00:00:00',
-      end: '2026-07-01 23:59:59',
-      perfectNum: null,
-    }),
+    context.__testHooks.countOrders(
+      'rp', {}, '2', '2026-07-01 00:00:00', '2026-07-01 23:59:59',
+    ),
     /meta\.total/,
   );
 
   context.__apiResponse = { code: 200, data: [], meta: { total: null } };
   await assert.rejects(
-    context.__testHooks.countOrders('rp', {}, {
-      status: '2',
-      timeType: '2',
-      start: '2026-07-01 00:00:00',
-      end: '2026-07-01 23:59:59',
-      perfectNum: null,
-    }),
+    context.__testHooks.countOrders(
+      'rp', {}, '2', '2026-07-01 00:00:00', '2026-07-01 23:59:59',
+    ),
+    /meta\.total/,
+  );
+});
+
+test('after-sale repair stats surface business errors from the warehouse endpoint', async () => {
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    response: { code: 30006, cn_message: '会话已失效' },
+  });
+
+  await assert.rejects(
+    context.__testHooks.countAfterSaleRepairStats(
+      { user_id: 119, type_arr: '1,2' },
+      '2026-07-01 15:00:00',
+      '2026-07-02 14:59:59',
+    ),
+    /会话已失效/,
+  );
+  assert.ok(context.__apiCalls.length > 0);
+  assert.ok(context.__apiCalls.every(call => call.path === '/warehouse/afterSale/orderList'));
+});
+
+test('after-sale repair stats require meta.total instead of trusting the first page length', async () => {
+  const context = loadHooks({
+    pathname: '/bsd-warehouse/single/rp',
+    response: { code: 200, data: [{}] },
+  });
+
+  await assert.rejects(
+    context.__testHooks.countAfterSaleRepairStats(
+      { user_id: 119, type_arr: '1,2' },
+      '2026-07-01 15:00:00',
+      '2026-07-02 14:59:59',
+    ),
     /meta\.total/,
   );
 });

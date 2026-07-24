@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.10.0
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在维修(RP)页按公司和本地日期统计新订单、进行中、已完成及良品/不良品占比，在 DOA 页统计完成订单。中国时间可切换为本地时区显示，悬停显示原文。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
+// @version      1.10.1
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；工程师订单的 DOA/RP 页保留完成统计，售后服务维修页按公司和本地日期统计新订单、进行中、已完成及良品/不良品占比。中国时间可切换为本地时区显示，悬停显示原文。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -43,12 +43,14 @@
     inboundList:       '/warehouse/warehouse/inboundOrderList',
     inboundDetail:     '/warehouse/warehouse/getInboundOrder',
     orderList:         '/engineer/afterSale/orderList',  // DOA + 维修(RP) 共用
+    afterSaleRepairList: '/warehouse/afterSale/orderList', // 售后服务 → 维修服务
   };
 
   // ── Page routing ────────────────────────────────────────────────────────
 
   function pageKind() {
     const p = location.pathname + location.hash;
+    if (/\/single\/rp(\b|$)/.test(p))                  return 'afterSaleRepair';
     if (/\/single\/refurbish(\b|$)/.test(p))           return 'list';
     if (/\/single\/retreadDetail(\b|$)/.test(p))       return 'detail';
     // head_entry_detail is intentionally not aggregable — the panel only opens on the list page.
@@ -104,8 +106,8 @@
 
   // Timezone the user is viewing the data in. Persisted across page loads.
   const TZ_STORAGE_KEY = 'bsd-agg-tz';
-  const ORDER_TZ_STORAGE_KEY = 'bsd-agg-order-tz';
-  const ORDER_DEFAULT_TZ = 'America/Los_Angeles';
+  const AFTER_SALE_REPAIR_TZ_STORAGE_KEY = 'bsd-agg-after-sale-repair-tz';
+  const AFTER_SALE_REPAIR_DEFAULT_TZ = 'America/Los_Angeles';
   const TZ_OPTIONS = [
     ['美东',     'America/New_York'],
     ['美中',     'America/Chicago'],
@@ -118,12 +120,14 @@
     try { return localStorage.getItem(TZ_STORAGE_KEY) || ''; }
     catch (_) { return ''; }
   })();
-  let orderUserTZ = (() => {
-    try { return localStorage.getItem(ORDER_TZ_STORAGE_KEY) || ''; }
+  let afterSaleRepairUserTZ = (() => {
+    try { return localStorage.getItem(AFTER_SALE_REPAIR_TZ_STORAGE_KEY) || ''; }
     catch (_) { return ''; }
   })();
   function localTZ() { return userTZ || systemTZ(); }
-  function orderStatsTZ() { return orderUserTZ || ORDER_DEFAULT_TZ; }
+  function afterSaleRepairStatsTZ() {
+    return afterSaleRepairUserTZ || AFTER_SALE_REPAIR_DEFAULT_TZ;
+  }
   function setUserTZ(tz) {
     userTZ = tz || '';
     try {
@@ -131,9 +135,11 @@
       else        localStorage.removeItem(TZ_STORAGE_KEY);
     } catch (_) {}
   }
-  function setOrderStatsTZ(tz) {
-    orderUserTZ = tz || ORDER_DEFAULT_TZ;
-    try { localStorage.setItem(ORDER_TZ_STORAGE_KEY, orderUserTZ); } catch (_) {}
+  function setAfterSaleRepairStatsTZ(tz) {
+    afterSaleRepairUserTZ = tz || AFTER_SALE_REPAIR_DEFAULT_TZ;
+    try {
+      localStorage.setItem(AFTER_SALE_REPAIR_TZ_STORAGE_KEY, afterSaleRepairUserTZ);
+    } catch (_) {}
   }
   function buildTzOptionsHtml(selectedTZ = localTZ()) {
     const sys = systemTZ();
@@ -256,12 +262,11 @@
     return fmtInTZ(now, tz).slice(0, 10);
   }
 
-  function orderStatsTodayStr() {
-    return fmtInTZ(new Date(), orderStatsTZ()).slice(0, 10);
+  function afterSaleRepairTodayStr() {
+    return fmtInTZ(new Date(), afterSaleRepairStatsTZ()).slice(0, 10);
   }
 
-  // DOA keeps its historical page-local date behavior. RP has a separate,
-  // explicit reporting timezone because its raw list timestamps are China time.
+  // Engineer DOA/RP pages keep their historical page-local date behavior.
   function pageLocalTodayStr() {
     return fmtInTZ(new Date(), systemTZ()).slice(0, 10);
   }
@@ -585,7 +590,8 @@
   function fabLabelFor(kind) {
     if (kind === 'inbound') return '🔍 物料/机型搜索';
     if (kind === 'doa')     return '📊 DOA 完成统计';
-    if (kind === 'rp')      return '📊 维修订单统计';
+    if (kind === 'rp')      return '📊 RP 完成统计';
+    if (kind === 'afterSaleRepair') return '📊 维修订单统计';
     return '📊 良品/不良品聚合';
   }
 
@@ -653,6 +659,7 @@
   function openPanel() {
     const kind = pageKind();
     if (kind === 'inbound') { openInboundPanel(); return; }
+    if (kind === 'afterSaleRepair') { openAfterSaleRepairPanel(); return; }
     if (kind === 'doa' || kind === 'rp') { openOrderCountPanel(kind); return; }
     const today = localTodayStr();
     const panel = document.createElement('div');
@@ -1680,11 +1687,10 @@
   }
 
   function decorateTimestamps(scope) {
-    // DOA retains its historical page-local behavior. Live inspection confirms
-    // that the RP list renders raw China wall-clock timestamps, so RP is converted
-    // to its explicit reporting timezone just like the other China-time pages.
+    // Engineer DOA/RP keep their historical local display. The separate
+    // after-sales repair list (/single/rp) renders raw China wall-clock values.
     const pk = pageKind();
-    if (!['list', 'detail', 'inbound', 'rp'].includes(pk)) return;
+    if (!['list', 'detail', 'inbound', 'afterSaleRepair'].includes(pk)) return;
     // Walk text nodes inside scope and wrap each raw timestamp in a marker span.
     // Marker spans are skipped, while later Vue text replacements remain eligible.
     const root = scope || document.body;
@@ -1712,8 +1718,8 @@
     const targets = [];
     while (walker.nextNode()) targets.push(walker.currentNode);
 
-    const tz = pk === 'rp' ? orderStatsTZ() : localTZ();
-    const tzScope = pk === 'rp' ? 'order' : 'general';
+    const tz = pk === 'afterSaleRepair' ? afterSaleRepairStatsTZ() : localTZ();
+    const tzScope = pk === 'afterSaleRepair' ? 'afterSaleRepair' : 'general';
     for (const node of targets) {
       const text = node.nodeValue;
       const frag = document.createDocumentFragment();
@@ -1812,19 +1818,15 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
-  // ── DOA / 维修(RP) 订单统计 ─────────────────────────────────────────────
+  // ── 工程师订单 DOA / 维修(RP) 完成统计 ─────────────────────────────────
   //
   // engineerDoa 与 engineerRepair 列表页共用 /engineer/afterSale/orderList。
-  // RP 页把所选统计时区的自然日换算成中国时间 API 窗口；新订单与进行中按
-  // 开始时间统计，完成及良品/不良品按完成时间统计。公司等条件沿用页面筛选。
-  // DOA 页保留原有的完成统计与页面本地日期口径。
+  // 面板按页面本地日期直接构造窗口，只统计完成及其良品/不良品结果。
   // DOA 页可勾选「同时统计 RP」、RP 页可勾选「同时统计 DOA」，给出 DOA+RP 合计。
 
-  // 订单工作流状态：'1' 进行中 / '2' 完成。
-  const OC_STATUS_PROGRESS = '1';
+  // 工程师订单工作流状态：'2' 完成。
   const OC_STATUS_DONE = '2';
-  // 页面时间类型：'1' 开始时间 / '2' 完成时间 / '3' 更新时间。
-  const OC_TIME_START = '1';
+  // time_type：'2' 完成时间。
   const OC_TIME_COMPLETION = '2';
   // 各页订单类型筛选(取自各自页面 query 对象)。
   const OC_TYPE = {
@@ -1833,70 +1835,24 @@
   };
   const OC_LABEL = { doa: 'DOA', rp: 'RP（维修）' };
 
-  // Read the selected inclusive calendar range. RP dates are interpreted in the
-  // explicit statistics timezone and converted to the China-time API window.
-  // DOA retains the existing page-local direct-string behavior.
+  // 工程师 DOA/RP 沿用原页面本地时间口径，不做时区换算。
   function readOrderDateRange(panel) {
     const mode = panel.dataset.dateMode || 'single';
-    const a = mode === 'single'
-      ? panel.querySelector('.date-input').value
-      : panel.querySelector('.date-start').value;
-    const b = mode === 'single'
-      ? a
-      : panel.querySelector('.date-end').value;
+    if (mode === 'single') {
+      const d = panel.querySelector('.date-input').value;
+      if (!d) return null;
+      return { label: d, start: d + ' 00:00:00', end: d + ' 23:59:59' };
+    }
+    const a = panel.querySelector('.date-start').value;
+    const b = panel.querySelector('.date-end').value;
     if (!a || !b) return null;
     const s = a <= b ? a : b;
     const e = a <= b ? b : a;
-    const kind = panel.dataset.panelKind || pageKind();
-    if (kind === 'rp') {
-      const tzSelect = panel.querySelector('.tz-select');
-      const tz = (tzSelect && tzSelect.value) || orderStatsTZ();
-      const win = zonedDateRangeToChinaWindow(s, e, tz);
-      return win ? Object.assign({}, win, { start: win.chinaStart, end: win.chinaEnd }) : null;
-    }
-    const start = `${s} 00:00:00`;
-    const end = `${e} 23:59:59`;
-    return {
-      label: s === e ? s : `${s} ~ ${e}`,
-      timezone: systemTZ(),
-      localStart: start,
-      localEnd: end,
-      start,
-      end,
-    };
-  }
-
-  // The two list pages historically accept different wall-clock query windows:
-  // RP uses China-time strings while DOA keeps page-local strings. Cross-counts
-  // must therefore derive each target's window from the same selected local day
-  // instead of reusing the primary page's API parameters verbatim.
-  function orderWindowForKind(dr, kind) {
-    if (!dr) return null;
-    const localStart = dr.localStart || dr.start;
-    const localEnd = dr.localEnd || dr.end;
-    if (!localStart || !localEnd) return null;
-    const converted = zonedDateRangeToChinaWindow(
-      String(localStart).slice(0, 10),
-      String(localEnd).slice(0, 10),
-      dr.timezone || systemTZ(),
-    );
-    if (!converted) return null;
-    if (kind === 'rp') {
-      return { start: converted.chinaStart, end: converted.chinaEnd };
-    }
-    if (kind === 'doa') {
-      const startUTC = parseServerTime(converted.chinaStart);
-      const endUTC = parseServerTime(converted.chinaEnd);
-      return startUTC && endUTC
-        ? { start: fmtInTZ(startUTC, systemTZ()), end: fmtInTZ(endUTC, systemTZ()) }
-        : null;
-    }
-    return null;
+    return { label: `${s} ~ ${e}`, start: s + ' 00:00:00', end: e + ' 23:59:59' };
   }
 
   function openOrderCountPanel(kind) {
-    const isRepair = kind === 'rp';
-    const today = isRepair ? orderStatsTodayStr() : pageLocalTodayStr();
+    const today = pageLocalTodayStr();
     const other = kind === 'doa' ? 'rp' : 'doa';
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
@@ -1904,12 +1860,10 @@
     panel.dataset.dateMode  = 'single';
     panel.innerHTML = `
       <header>
-        <span class="title">${isRepair ? '维修服务订单统计' : (OC_LABEL[kind] + ' 完成统计')}</span>
+        <span class="title">${OC_LABEL[kind]} 完成统计</span>
         <span class="close" title="关闭">✕</span>
       </header>
-      <div class="body"><div class="empty">${isRepair
-        ? '选择日期后点「查询」。公司及其余条件沿用页面顶部筛选；新订单、进行中按开始时间，已完成按完成时间。'
-        : '选择日期后点「查询」。公司及其余条件沿用页面顶部筛选，状态固定为「完成」。'}</div></div>
+      <div class="body"><div class="empty">选择日期后点「查询」。公司及其余条件沿用页面顶部筛选，状态固定为「完成」。</div></div>
       <footer>
         <div class="date-controls">
           <div class="mode-tabs" role="tablist">
@@ -1917,7 +1871,7 @@
             <button class="mode-tab"        data-mode="range"  role="tab">区间</button>
           </div>
           <div class="date-fields single">
-            <label class="date-label">${isRepair ? '本地日期' : '日期'}</label>
+            <label class="date-label">日期</label>
             <input type="date" class="date-input" value="${today}">
           </div>
           <div class="date-fields range" style="display:none">
@@ -1926,10 +1880,6 @@
             <label class="date-label">到</label>
             <input type="date" class="date-end"   value="${today}">
           </div>
-          ${isRepair ? `
-            <label class="date-label tz-label">统计时区</label>
-            <select class="tz-select">${buildTzOptionsHtml(orderStatsTZ())}</select>
-          ` : ''}
         </div>
         <div class="footer-actions">
           <label class="date-label" style="display:flex;align-items:center;gap:4px;cursor:pointer">
@@ -1941,16 +1891,6 @@
       </footer>
     `;
     panel.querySelector('.close').addEventListener('click', () => destroyPanel(panel));
-
-    if (isRepair) {
-      const tzSelect = panel.querySelector('.tz-select');
-      tzSelect.addEventListener('change', () => {
-        setOrderStatsTZ(tzSelect.value);
-        relabelDecoratedTimes(orderStatsTZ(), 'order');
-        panel.querySelector('.body').innerHTML =
-          '<div class="empty">统计时区已更改；页面时间已同步，请重新点「查询」。</div>';
-      });
-    }
 
     // 单日 / 区间 切换。
     const tabs   = panel.querySelectorAll('.mode-tab');
@@ -2027,17 +1967,11 @@
     return found ? (found.company || found.cn_company || ('公司 ' + id)) : ('公司 ' + id);
   }
 
-  // Count one order metric from pagination meta.total. Every metric explicitly
-  // replaces status/time/result filters inherited from the visible page, so its
-  // result cannot be narrowed by a stale UI selection.
-  async function countOrders(kind, baseQuery, options) {
-    const o = options || {};
+  // 工程师 DOA/RP：沿用页面筛选，固定统计完成状态和完成时间。
+  async function countOrders(kind, baseQuery, timeType, winStart, winEnd, perfectNum = null) {
     const params = Object.assign({}, baseQuery);
     delete params.type; delete params.type_arr; delete params.is_child; // 类型按 kind 重设
-    delete params.status;
-    delete params.time_type;
-    delete params.start;
-    delete params.end;
+    // 结果分类必须由本次统计明确设置，不能继承陈旧筛选。
     delete params.perfect_num;
     delete params.un_perfect_num;
     // service_type is an RP-only filter. Carrying it into a cross-page DOA
@@ -2045,15 +1979,14 @@
     if (kind === 'doa') delete params.service_type;
     delete params.page; delete params.limit;
     Object.assign(params, OC_TYPE[kind], {
-      time_type: o.timeType,
-      start:     o.start,
-      end:       o.end,
+      status:    OC_STATUS_DONE,
+      time_type: timeType,
+      start:     winStart,
+      end:       winEnd,
       page:      1,
       limit:     1,
     });
-    // status=null means all workflow states and is how "new orders" is defined.
-    if (o.status !== null && o.status !== undefined && o.status !== '') params.status = o.status;
-    if (o.perfectNum !== null && o.perfectNum !== undefined) params.perfect_num = o.perfectNum;
+    if (perfectNum !== null) params.perfect_num = perfectNum;
     const resp = await apiGet(API.orderList, params);
     if (!resp || typeof resp !== 'object') {
       throw new Error('统计接口返回为空');
@@ -2072,16 +2005,10 @@
   }
 
   async function countOrderStats(kind, baseQuery, timeType, winStart, winEnd) {
-    const baseOptions = {
-      status: OC_STATUS_DONE,
-      timeType,
-      start: winStart,
-      end: winEnd,
-    };
     const [done, positive, negative] = await Promise.all([
-      countOrders(kind, baseQuery, baseOptions),
-      countOrders(kind, baseQuery, Object.assign({}, baseOptions, { perfectNum: 1 })),
-      countOrders(kind, baseQuery, Object.assign({}, baseOptions, { perfectNum: 0 })),
+      countOrders(kind, baseQuery, timeType, winStart, winEnd),
+      countOrders(kind, baseQuery, timeType, winStart, winEnd, 1),
+      countOrders(kind, baseQuery, timeType, winStart, winEnd, 0),
     ]);
     // Fail visibly if the backend ever stops honoring perfect_num; otherwise
     // both classification calls could equal the unfiltered total.
@@ -2091,37 +2018,13 @@
     return { done, positive, negative };
   }
 
-  async function countRepairStats(baseQuery, winStart, winEnd) {
-    const started = { timeType: OC_TIME_START, start: winStart, end: winEnd };
-    const completed = {
-      status: OC_STATUS_DONE,
-      timeType: OC_TIME_COMPLETION,
-      start: winStart,
-      end: winEnd,
-    };
-    const [newOrders, inProgress, done, positive, negative] = await Promise.all([
-      countOrders('rp', baseQuery, Object.assign({ status: null }, started)),
-      countOrders('rp', baseQuery, Object.assign({ status: OC_STATUS_PROGRESS }, started)),
-      countOrders('rp', baseQuery, completed),
-      countOrders('rp', baseQuery, Object.assign({}, completed, { perfectNum: 1 })),
-      countOrders('rp', baseQuery, Object.assign({}, completed, { perfectNum: 0 })),
-    ]);
-    if (positive + negative > done) {
-      throw new Error('统计接口返回的良品/不良品分类数量不一致');
-    }
-    return { newOrders, inProgress, done, positive, negative };
-  }
-
   async function runOrderCount(panel, kind) {
     const body    = panel.querySelector('.body');
     const run     = panel.querySelector('.run');
     const crossCb = panel.querySelector('.cross-cb');
 
-    const dr = readOrderDateRange(panel);
+    const dr = readOrderDateRange(panel);   // 工程师页日期直接使用，不做时区换算
     if (!dr) { flash(body, '请选择有效日期'); return; }
-    const rpWindow = orderWindowForKind(dr, 'rp');
-    const doaWindow = orderWindowForKind(dr, 'doa');
-    if (!rpWindow || !doaWindow) { flash(body, '无法换算所选日期的统计窗口'); return; }
 
     const base = readOrderPageQuery(kind);
     if (!base) {
@@ -2131,105 +2034,28 @@
     flattenParams(base);
     const companyId    = base.user_id != null ? base.user_id : '';
     const companyLabel = companyNameById(companyId);
-    const timeType  = OC_TIME_COMPLETION;
+    const timeType  = OC_TIME_COMPLETION;   // 口径固定为完成时间
     const alsoOther = !!(crossCb && crossCb.checked);
+    const other     = kind === 'doa' ? 'rp' : 'doa';
 
     run.disabled = true;
     body.innerHTML = '<div class="loading">查询中…</div>';
     try {
       const counts = { doa: null, rp: null };
-      if (kind === 'rp') {
-        counts.rp = await countRepairStats(base, rpWindow.start, rpWindow.end);
-        if (alsoOther) {
-          counts.doa = await countOrderStats('doa', base, timeType, doaWindow.start, doaWindow.end);
-        }
-      } else {
-        counts.doa = await countOrderStats('doa', base, timeType, doaWindow.start, doaWindow.end);
-        if (alsoOther) {
-          counts.rp = await countOrderStats('rp', base, timeType, rpWindow.start, rpWindow.end);
-        }
+      counts[kind] = await countOrderStats(kind, base, timeType, dr.start, dr.end);
+      if (alsoOther) {
+        counts[other] = await countOrderStats(other, base, timeType, dr.start, dr.end);
       }
       renderOrderCount(body, { kind, dr, companyLabel, timeType, counts });
     } catch (err) {
-      console.error('[BESENDER 售后统计] 查询失败', err);
+      console.error('[BESENDER 完成统计] 查询失败', err);
       body.innerHTML = `<div class="error">查询失败：${escapeHtml(err.message || String(err))}</div>`;
     } finally {
       run.disabled = false;
     }
   }
 
-  function renderRepairCount(container, o) {
-    const stats = o.counts.rp;
-    const localStart = o.dr.localStart || o.dr.label || '';
-    const localEnd = o.dr.localEnd || o.dr.label || '';
-    const chinaStart = o.dr.start || o.dr.chinaStart || '';
-    const chinaEnd = o.dr.end || o.dr.chinaEnd || '';
-    const unclassified = Math.max(0, stats.done - stats.positive - stats.negative);
-    const metricRow = (label, count, rate = null, cls = '') => `
-      <tr${cls === 'total' ? ' class="total"' : ''}>
-        <td>${escapeHtml(label)}</td>
-        <td class="rate${cls === 'good' || cls === 'bad' ? ` ${cls}` : ''}">${count}</td>
-        <td class="rate${cls === 'good' || cls === 'bad' ? ` ${cls}` : ''}">${rate == null ? '—' : rate}</td>
-      </tr>`;
-
-    let crossHtml = '';
-    if (o.counts.doa != null) {
-      const doa = o.counts.doa;
-      const combined = {
-        done: doa.done + stats.done,
-        positive: doa.positive + stats.positive,
-        negative: doa.negative + stats.negative,
-      };
-      const comparisonRow = (label, s, cls = '') => `
-        <tr${cls ? ` class="${cls}"` : ''}>
-          <td>${escapeHtml(label)}</td>
-          <td class="good" style="text-align:right">${s.positive}（${fmtRate(s.positive, s.done)}）</td>
-          <td class="bad" style="text-align:right">${s.negative}（${fmtRate(s.negative, s.done)}）</td>
-          <td class="rate">${s.done}</td>
-        </tr>`;
-      crossHtml = `
-        <div class="hint" style="margin-top:10px">同时统计 DOA：以下仅比较按完成时间落入区间的完成结果。</div>
-        <table class="summary">
-          <thead><tr>
-            <th>类型</th><th style="text-align:right">良品（通过）</th>
-            <th style="text-align:right">不良品（不通过）</th><th style="text-align:right">完成数量</th>
-          </tr></thead>
-          <tbody>
-            ${comparisonRow('RP（维修）', stats)}
-            ${comparisonRow('DOA', doa)}
-            ${comparisonRow('合计 (DOA+RP)', combined, 'total')}
-          </tbody>
-        </table>`;
-    }
-
-    container.innerHTML = `
-      <div class="hint">
-        本地日期 <b>${escapeHtml(localStart)}</b> ~ <b>${escapeHtml(localEnd)}</b>
-        （${escapeHtml(o.dr.timezone)}）<br>
-        中国查询窗口 <b>${escapeHtml(chinaStart)}</b> ~ <b>${escapeHtml(chinaEnd)}</b><br>
-        公司：<b>${escapeHtml(o.companyLabel)}</b>（沿用页面筛选）｜
-        口径：<b>新订单/进行中按开始时间，已完成按完成时间</b>
-      </div>
-      <table class="summary">
-        <thead><tr><th>指标</th><th style="text-align:right">数量</th><th style="text-align:right">占已完成</th></tr></thead>
-        <tbody>
-          ${metricRow('新订单', stats.newOrders)}
-          ${metricRow('进行中', stats.inProgress)}
-          ${metricRow('已完成', stats.done, stats.done ? '100.0%' : '—', 'total')}
-          ${metricRow('良品', stats.positive, fmtRate(stats.positive, stats.done), 'good')}
-          ${metricRow('不良品', stats.negative, fmtRate(stats.negative, stats.done), 'bad')}
-          ${unclassified ? metricRow('未分类', unclassified, fmtRate(unclassified, stats.done)) : ''}
-        </tbody>
-      </table>
-      ${crossHtml}
-    `;
-  }
-
   function renderOrderCount(container, o) {
-    if (o.kind === 'rp' && o.counts.rp && o.counts.rp.newOrders != null) {
-      renderRepairCount(container, o);
-      return;
-    }
     const rows = [];
     if (o.counts.doa != null) rows.push(['DOA', o.counts.doa]);
     if (o.counts.rp  != null) rows.push(['RP（维修）', o.counts.rp]);
@@ -2275,11 +2101,269 @@
     `;
   }
 
+  // ── 售后服务 → 维修服务订单统计 (/single/rp) ──────────────────────────
+  //
+  // 该页面与上面的工程师 RP 是两个独立模块，使用不同接口和状态定义：
+  //   新订单 status=1，按创建时间 time_type=3；
+  //   进行中 status=2，按开始时间 time_type=1；
+  //   已完成 status=3，按完成时间 time_type=2；
+  //   良品/不良品使用 is_perfect=1/0。
+  // 页面展示的是中国墙钟时间，统计日期始终按用户明确选择的时区解释，默认美西。
+
+  const ASR_STATUS_NEW = '1';
+  const ASR_STATUS_PROGRESS = '2';
+  const ASR_STATUS_DONE = '3';
+  const ASR_TIME_START = '1';
+  const ASR_TIME_COMPLETION = '2';
+  const ASR_TIME_CREATED = '3';
+  const ASR_TYPE_ARR = '1,2';
+
+  function readAfterSaleRepairDateRange(panel) {
+    const mode = panel.dataset.dateMode || 'single';
+    const a = mode === 'single'
+      ? panel.querySelector('.date-input').value
+      : panel.querySelector('.date-start').value;
+    const b = mode === 'single'
+      ? a
+      : panel.querySelector('.date-end').value;
+    if (!a || !b) return null;
+    const s = a <= b ? a : b;
+    const e = a <= b ? b : a;
+    const tzSelect = panel.querySelector('.tz-select');
+    const tz = (tzSelect && tzSelect.value) || afterSaleRepairStatsTZ();
+    const win = zonedDateRangeToChinaWindow(s, e, tz);
+    return win
+      ? Object.assign({}, win, { start: win.chinaStart, end: win.chinaEnd })
+      : null;
+  }
+
+  function openAfterSaleRepairPanel() {
+    const today = afterSaleRepairTodayStr();
+    const panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.dataset.panelKind = 'afterSaleRepair';
+    panel.dataset.dateMode = 'single';
+    panel.innerHTML = `
+      <header>
+        <span class="title">售后服务 · 维修订单统计</span>
+        <span class="close" title="关闭">✕</span>
+      </header>
+      <div class="body"><div class="empty">
+        选择日期后点「查询」。公司及其余条件沿用页面顶部筛选；
+        新订单按创建时间，进行中按开始时间，已完成按完成时间。
+      </div></div>
+      <footer>
+        <div class="date-controls">
+          <div class="mode-tabs" role="tablist">
+            <button class="mode-tab active" data-mode="single" role="tab">单日</button>
+            <button class="mode-tab" data-mode="range" role="tab">区间</button>
+          </div>
+          <div class="date-fields single">
+            <label class="date-label">本地日期</label>
+            <input type="date" class="date-input" value="${today}">
+          </div>
+          <div class="date-fields range" style="display:none">
+            <label class="date-label">从</label>
+            <input type="date" class="date-start" value="${today}">
+            <label class="date-label">到</label>
+            <input type="date" class="date-end" value="${today}">
+          </div>
+          <label class="date-label tz-label">统计时区</label>
+          <select class="tz-select">${buildTzOptionsHtml(afterSaleRepairStatsTZ())}</select>
+        </div>
+        <div class="footer-actions">
+          <span class="hint">始终按所选时区的完整自然日统计</span>
+          <span style="flex:1"></span>
+          <button class="btn run">查询</button>
+        </div>
+      </footer>
+    `;
+    panel.querySelector('.close').addEventListener('click', () => destroyPanel(panel));
+
+    const tzSelect = panel.querySelector('.tz-select');
+    tzSelect.addEventListener('change', () => {
+      setAfterSaleRepairStatsTZ(tzSelect.value);
+      relabelDecoratedTimes(afterSaleRepairStatsTZ(), 'afterSaleRepair');
+      panel.querySelector('.body').innerHTML =
+        '<div class="empty">统计时区已更改；页面时间已同步，请重新点「查询」。</div>';
+    });
+
+    const tabs = panel.querySelectorAll('.mode-tab');
+    const single = panel.querySelector('.date-fields.single');
+    const range = panel.querySelector('.date-fields.range');
+    tabs.forEach(t => t.addEventListener('click', () => {
+      tabs.forEach(x => x.classList.toggle('active', x === t));
+      const mode = t.dataset.mode;
+      single.style.display = mode === 'single' ? '' : 'none';
+      range.style.display = mode === 'range' ? '' : 'none';
+      panel.dataset.dateMode = mode;
+    }));
+
+    panel.querySelector('.run').addEventListener('click', () => runAfterSaleRepairCount(panel));
+    document.body.appendChild(panel);
+    registerPanel(panel);
+  }
+
+  function afterSaleRepairQueryMatches(query) {
+    if (!query || typeof query !== 'object') return false;
+    if (!('user_id' in query) || !('status' in query)
+        || !('is_perfect' in query) || !('time_type' in query)) return false;
+    const rawTypes = Array.isArray(query.type_arr)
+      ? query.type_arr
+      : String(query.type_arr || '').split(',');
+    const types = rawTypes.map(v => String(v).trim()).filter(Boolean).sort().join(',');
+    return types === ASR_TYPE_ARR;
+  }
+
+  function readAfterSaleRepairPageQuery() {
+    const candidates = findVueComponents(c => {
+      if (!c || !afterSaleRepairQueryMatches(c.query)) return false;
+      const name = c.$options && (c.$options.name || c.$options._componentTag || '');
+      if (name !== 'order_rp') return false;
+      return typeof c.getData === 'function';
+    });
+    const visible = candidates.filter(isVisibleVueComponent);
+    const comp = visible.length === 1 ? visible[0] : null;
+    if (!comp) return null;
+    const out = {};
+    for (const k of Object.keys(comp.query)) {
+      const v = comp.query[k];
+      if (v === undefined || v === null || v === '') continue;
+      if (Array.isArray(v)) out[k] = v.slice();
+      else if (typeof v === 'object') continue;
+      else out[k] = v;
+    }
+    return out;
+  }
+
+  async function countAfterSaleRepairOrders(baseQuery, options) {
+    const o = options || {};
+    const params = Object.assign({}, baseQuery);
+    delete params.status;
+    delete params.time_type;
+    delete params.start;
+    delete params.end;
+    delete params.is_perfect;
+    delete params.perfect_num;
+    delete params.un_perfect_num;
+    delete params.page;
+    delete params.limit;
+    Object.assign(params, {
+      type_arr: ASR_TYPE_ARR,
+      status: o.status,
+      time_type: o.timeType,
+      start: o.start,
+      end: o.end,
+      page: 1,
+      limit: 1,
+    });
+    if (o.isPerfect !== null && o.isPerfect !== undefined) {
+      params.is_perfect = o.isPerfect;
+    }
+
+    const resp = await apiGet(API.afterSaleRepairList, params);
+    if (!resp || typeof resp !== 'object') throw new Error('统计接口返回为空');
+    if (resp.code != null && Number(resp.code) !== 200) {
+      throw new Error(resp.cn_message || resp.message || ('统计接口错误（code ' + resp.code + '）'));
+    }
+    const rawTotal = resp.meta && resp.meta.total;
+    const total = Number(rawTotal);
+    if (rawTotal !== undefined && rawTotal !== null && rawTotal !== ''
+        && Number.isFinite(total) && total >= 0) return total;
+    throw new Error('统计接口缺少有效的 meta.total');
+  }
+
+  async function countAfterSaleRepairStats(baseQuery, winStart, winEnd) {
+    const window = { start: winStart, end: winEnd };
+    const completed = Object.assign({}, window, {
+      status: ASR_STATUS_DONE,
+      timeType: ASR_TIME_COMPLETION,
+    });
+    const [newOrders, inProgress, done, positive, negative] = await Promise.all([
+      countAfterSaleRepairOrders(baseQuery, Object.assign({}, window, {
+        status: ASR_STATUS_NEW,
+        timeType: ASR_TIME_CREATED,
+      })),
+      countAfterSaleRepairOrders(baseQuery, Object.assign({}, window, {
+        status: ASR_STATUS_PROGRESS,
+        timeType: ASR_TIME_START,
+      })),
+      countAfterSaleRepairOrders(baseQuery, completed),
+      countAfterSaleRepairOrders(baseQuery, Object.assign({}, completed, { isPerfect: 1 })),
+      countAfterSaleRepairOrders(baseQuery, Object.assign({}, completed, { isPerfect: 0 })),
+    ]);
+    if (positive + negative > done) {
+      throw new Error('统计接口返回的良品/不良品分类数量不一致');
+    }
+    return { newOrders, inProgress, done, positive, negative };
+  }
+
+  async function runAfterSaleRepairCount(panel) {
+    const body = panel.querySelector('.body');
+    const run = panel.querySelector('.run');
+    const dr = readAfterSaleRepairDateRange(panel);
+    if (!dr) { flash(body, '请选择有效日期和统计时区'); return; }
+
+    const base = readAfterSaleRepairPageQuery();
+    if (!base) {
+      flash(body, '未找到售后维修页面筛选条件，请等列表加载完成后重试');
+      return;
+    }
+    flattenParams(base);
+    const companyId = base.user_id != null ? base.user_id : '';
+    const companyLabel = companyNameById(companyId);
+
+    run.disabled = true;
+    body.innerHTML = '<div class="loading">查询中…</div>';
+    try {
+      const stats = await countAfterSaleRepairStats(base, dr.start, dr.end);
+      renderAfterSaleRepairCount(body, { dr, companyLabel, stats });
+    } catch (err) {
+      console.error('[BESENDER 售后维修统计] 查询失败', err);
+      body.innerHTML = `<div class="error">查询失败：${escapeHtml(err.message || String(err))}</div>`;
+    } finally {
+      run.disabled = false;
+    }
+  }
+
+  function renderAfterSaleRepairCount(container, o) {
+    const stats = o.stats;
+    const unclassified = Math.max(0, stats.done - stats.positive - stats.negative);
+    const metricRow = (label, count, rate = null, cls = '') => `
+      <tr${cls === 'total' ? ' class="total"' : ''}>
+        <td>${escapeHtml(label)}</td>
+        <td class="rate${cls === 'good' || cls === 'bad' ? ` ${cls}` : ''}">${count}</td>
+        <td class="rate${cls === 'good' || cls === 'bad' ? ` ${cls}` : ''}">${rate == null ? '—' : rate}</td>
+      </tr>`;
+
+    container.innerHTML = `
+      <div class="hint">
+        本地日期 <b>${escapeHtml(o.dr.localStart)}</b> ~ <b>${escapeHtml(o.dr.localEnd)}</b>
+        （${escapeHtml(o.dr.timezone)}）<br>
+        中国查询窗口 <b>${escapeHtml(o.dr.chinaStart)}</b> ~ <b>${escapeHtml(o.dr.chinaEnd)}</b><br>
+        公司：<b>${escapeHtml(o.companyLabel)}</b>（沿用售后维修页面筛选）<br>
+        口径：<b>新订单按创建时间；进行中按开始时间；已完成按完成时间</b>
+      </div>
+      <table class="summary">
+        <thead><tr><th>指标</th><th style="text-align:right">数量</th><th style="text-align:right">占已完成</th></tr></thead>
+        <tbody>
+          ${metricRow('新订单', stats.newOrders)}
+          ${metricRow('进行中', stats.inProgress)}
+          ${metricRow('已完成', stats.done, stats.done ? '100.0%' : '—', 'total')}
+          ${metricRow('良品', stats.positive, fmtRate(stats.positive, stats.done), 'good')}
+          ${metricRow('不良品', stats.negative, fmtRate(stats.negative, stats.done), 'bad')}
+          ${unclassified ? metricRow('未分类', unclassified, fmtRate(unclassified, stats.done)) : ''}
+        </tbody>
+      </table>
+    `;
+  }
+
   // ── Boot ────────────────────────────────────────────────────────────────
 
   function isAggregablePage() {
     const k = pageKind();
-    return k === 'list' || k === 'detail' || k === 'inbound' || k === 'doa' || k === 'rp';
+    return k === 'list' || k === 'detail' || k === 'inbound'
+      || k === 'doa' || k === 'rp' || k === 'afterSaleRepair';
   }
 
   function boot() {
@@ -2287,11 +2371,11 @@
     if (isAggregablePage()) {
       const k = pageKind();
       ensureFab();
-      // DOA keeps its page-local display; RP and the remaining supported pages
-      // expose China timestamps and are decorated in their selected timezone.
-      if (k !== 'doa') {
-        const tz = k === 'rp' ? orderStatsTZ() : localTZ();
-        const tzScope = k === 'rp' ? 'order' : 'general';
+      // Engineer DOA/RP retain their original local display. The separate
+      // after-sales repair page and the other supported pages expose China time.
+      if (k !== 'doa' && k !== 'rp') {
+        const tz = k === 'afterSaleRepair' ? afterSaleRepairStatsTZ() : localTZ();
+        const tzScope = k === 'afterSaleRepair' ? 'afterSaleRepair' : 'general';
         // Vue keep-alive can leave an already-decorated page connected but hidden.
         // Restore this page's own timezone before decorating any newly-rendered rows.
         relabelDecoratedTimes(tz, tzScope);
