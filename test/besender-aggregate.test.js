@@ -586,7 +586,7 @@ test('after-sale repair parses selected company ids from arrays and comma string
   );
 });
 
-test('after-sale repair stats query five event-time metrics without current-status filters', async () => {
+test('after-sale repair stats use current status for open work and event time for completion', async () => {
   const context = loadHooks({
     pathname: '/bsd-warehouse/single/rp',
     responses: [
@@ -629,24 +629,28 @@ test('after-sale repair stats query five event-time metrics without current-stat
   assert.equal(context.__apiCalls.length, 5);
 
   const calls = context.__apiCalls.map(call => call.params);
+  assert.equal(calls[0].status, '1');
   assert.equal(calls[0].time_type, '3');
   assert.equal('is_perfect' in calls[0], false);
 
+  assert.equal(calls[1].status, '2');
   assert.equal(calls[1].time_type, '1');
   assert.equal('is_perfect' in calls[1], false);
 
+  assert.equal('status' in calls[2], false);
   assert.equal(calls[2].time_type, '2');
   assert.equal('is_perfect' in calls[2], false);
 
+  assert.equal('status' in calls[3], false);
   assert.equal(calls[3].time_type, '2');
   assert.equal(calls[3].is_perfect, 1);
 
+  assert.equal('status' in calls[4], false);
   assert.equal(calls[4].time_type, '2');
   assert.equal(calls[4].is_perfect, 0);
 
   context.__apiCalls.forEach(({ path, params }) => {
     assert.equal(path, '/warehouse/afterSale/orderList');
-    assert.equal('status' in params, false);
     assert.equal(String(params.user_id), '119');
     assert.equal(params.keyword, 'phone');
     assert.equal(params.type_arr, '1,2');
@@ -658,22 +662,28 @@ test('after-sale repair stats query five event-time metrics without current-stat
   });
 });
 
-test('after-sale repair removes a stale current status so later-shipped orders remain eligible', async () => {
-  const totals = {
-    '3/all': 4,
-    '1/all': 2,
-    '2/all': 3,
-    '2/1': 2,
-    '2/0': 1,
-  };
+test('after-sale repair excludes progressed open work but retains shipped completions', async () => {
   const context = loadHooks({
     pathname: '/bsd-warehouse/single/rp',
     apiHandler(_path, params) {
-      // A later-shipped order would be excluded if the stale page status leaked
-      // into any of these historical event-time requests.
-      if ('status' in params) return { code: 200, data: [], meta: { total: 0 } };
-      const signature = `${params.time_type}/${params.is_perfect == null ? 'all' : params.is_perfect}`;
-      return { code: 200, data: [], meta: { total: totals[signature] } };
+      let total;
+      if (params.time_type === '3') {
+        // Without status=1 this would also include two orders that progressed.
+        total = params.status === '1' ? 2 : 4;
+      } else if (params.time_type === '1') {
+        // Without status=2 this would also include two orders later completed.
+        total = params.status === '2' ? 1 : 3;
+      } else if ('status' in params) {
+        // A current completed-status filter would omit a later-shipped order.
+        total = 2;
+      } else if (params.is_perfect === 1) {
+        total = 2;
+      } else if (params.is_perfect === 0) {
+        total = 1;
+      } else {
+        total = 3;
+      }
+      return { code: 200, data: [], meta: { total } };
     },
   });
 
@@ -684,8 +694,8 @@ test('after-sale repair removes a stale current status so later-shipped orders r
   );
 
   assert.deepEqual({ ...stats }, {
-    newOrders: 4,
-    inProgress: 2,
+    newOrders: 2,
+    inProgress: 1,
     done: 3,
     positive: 2,
     negative: 1,
@@ -693,10 +703,9 @@ test('after-sale repair removes a stale current status so later-shipped orders r
   assert.equal(context.__apiCalls.length, 5);
   assert.deepEqual(
     Array.from(context.__apiCalls, ({ params }) =>
-      `${params.time_type}/${params.is_perfect == null ? 'all' : params.is_perfect}`),
-    ['3/all', '1/all', '2/all', '2/1', '2/0'],
+      `${params.status == null ? 'none' : params.status}/${params.time_type}/${params.is_perfect == null ? 'all' : params.is_perfect}`),
+    ['1/3/all', '2/1/all', 'none/2/all', 'none/2/1', 'none/2/0'],
   );
-  context.__apiCalls.forEach(({ params }) => assert.equal('status' in params, false));
 });
 
 test('multi-company after-sale repair makes only five requests per company and sums their totals', async () => {
@@ -750,13 +759,18 @@ test('multi-company after-sale repair makes only five requests per company and s
   for (const params of calls) {
     assert.equal(Array.isArray(params.user_id), false);
     assert.doesNotMatch(String(params.user_id), /,/);
-    assert.equal('status' in params, false);
   }
 
-  const expectedSignatures = ['3/all', '1/all', '2/all', '2/1', '2/0'];
+  const expectedSignatures = [
+    '1/3/all',
+    '2/1/all',
+    'none/2/all',
+    'none/2/1',
+    'none/2/0',
+  ];
   for (let offset = 0; offset < calls.length; offset += 5) {
     const signatures = calls.slice(offset, offset + 5).map(params =>
-      `${params.time_type}/${params.is_perfect == null ? 'all' : params.is_perfect}`
+      `${params.status == null ? 'none' : params.status}/${params.time_type}/${params.is_perfect == null ? 'all' : params.is_perfect}`
     );
     assert.deepEqual(signatures, expectedSignatures);
   }
@@ -847,10 +861,13 @@ test('explicitly empty after-sale repair user_id keeps the five-request all-comp
     negative: 1,
   });
   assert.equal(context.__apiCalls.length, 5);
-  context.__apiCalls.forEach(({ params }) => {
+  const calls = Array.from(context.__apiCalls, call => call.params);
+  calls.forEach(params => {
     assert.equal('user_id' in params, false);
-    assert.equal('status' in params, false);
   });
+  assert.deepEqual(calls.map(params => params.status == null ? 'none' : params.status), [
+    '1', '2', 'none', 'none', 'none',
+  ]);
 });
 
 test('after-sale repair limits per-company statistics to two companies at a time', async () => {

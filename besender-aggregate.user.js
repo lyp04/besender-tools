@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.10.3
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；工程师订单的 DOA/RP 页保留完成统计，售后服务维修页按公司和本地日期统计新订单、进行中、已完成及良品/不良品占比，多选公司时按指标缩进显示公司及品质明细。中国时间可切换为本地时区显示，悬停显示原文。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
+// @version      1.10.4
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；工程师订单的 DOA/RP 页保留完成统计，售后服务维修页按公司和本地日期统计当前新订单、当前进行中、完成事件及良品/不良品占比，多选公司时按指标缩进显示公司及品质明细。中国时间可切换为本地时区显示，悬停显示原文。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -2118,14 +2118,16 @@
   // ── 售后服务 → 维修服务订单统计 (/single/rp) ──────────────────────────
   //
   // 该页面与上面的工程师 RP 是两个独立模块，使用不同接口和时间字段：
-  //   新订单按创建时间 time_type=3；
-  //   进行中按开始时间 time_type=1；
+  //   当前新订单 status=1，按创建时间 time_type=3；
+  //   当前进行中 status=2，按开始时间 time_type=1；
   //   已完成按完成时间 time_type=2；
   //   良品/不良品使用 is_perfect=1/0。
-  // 这些是流程事件统计，不能再叠加当前 status；否则订单后来进入下一状态
-  // （尤其完成后已出库）时会从历史统计中消失。
+  // 新订单和进行中是当前状态桶；完成及品质是历史完成事件，不叠加当前 status，
+  // 否则完成后已出库的订单会从完成统计中消失。
   // 页面展示的是中国墙钟时间，统计日期始终按用户明确选择的时区解释，默认美西。
 
+  const ASR_STATUS_NEW = '1';
+  const ASR_STATUS_PROGRESS = '2';
   const ASR_TIME_START = '1';
   const ASR_TIME_COMPLETION = '2';
   const ASR_TIME_CREATED = '3';
@@ -2226,8 +2228,8 @@
       </header>
       <div class="body"><div class="empty">
         选择日期后点「查询」。公司及其余条件沿用页面顶部筛选；
-        新订单按创建时间，进行中按开始时间，已完成按完成时间，
-        不受订单之后流转到其它状态影响。
+        当前新订单按创建时间，当前进行中按开始时间；已完成按完成时间，
+        完成后即使已出库仍计入已完成。
       </div></div>
       <footer>
         <div class="date-controls">
@@ -2335,6 +2337,9 @@
       page: 1,
       limit: 1,
     });
+    if (o.status !== null && o.status !== undefined) {
+      params.status = o.status;
+    }
     if (o.isPerfect !== null && o.isPerfect !== undefined) {
       params.is_perfect = o.isPerfect;
     }
@@ -2358,9 +2363,11 @@
     });
     const [newOrders, inProgress, done, positive, negative] = await Promise.all([
       countAfterSaleRepairOrders(baseQuery, Object.assign({}, window, {
+        status: ASR_STATUS_NEW,
         timeType: ASR_TIME_CREATED,
       })),
       countAfterSaleRepairOrders(baseQuery, Object.assign({}, window, {
+        status: ASR_STATUS_PROGRESS,
         timeType: ASR_TIME_START,
       })),
       countAfterSaleRepairOrders(baseQuery, completed),
@@ -2500,8 +2507,8 @@
         （${escapeHtml(o.dr.timezone)}）<br>
         中国查询窗口 <b>${escapeHtml(o.dr.chinaStart)}</b> ~ <b>${escapeHtml(o.dr.chinaEnd)}</b><br>
         公司：<b>${escapeHtml(o.companyLabel)}</b>（沿用售后维修页面筛选）<br>
-        口径：<b>新订单按创建时间；进行中按开始时间；已完成按完成时间</b><br>
-        各项按流程事件统计，不受订单之后的当前状态影响（已出库仍计入完成）。
+        口径：<b>当前新订单按创建时间；当前进行中按开始时间；已完成按完成时间</b><br>
+        新订单与进行中限定当前状态；已完成按完成事件统计（已出库仍计入完成）。
       </div>
       <table class="summary">
         <thead><tr><th>指标</th><th style="text-align:right">数量</th><th style="text-align:right">${companyDetails.length ? '比例' : '占已完成'}</th></tr></thead>
