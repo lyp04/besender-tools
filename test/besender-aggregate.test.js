@@ -984,7 +984,7 @@ test('after-sale repair renders new, in-progress, completed, good, and bad metri
   assert.doesNotMatch(container.innerHTML, /company-detail|公司明细/);
 });
 
-test('after-sale repair renders indented five-metric detail for each selected company', () => {
+test('after-sale repair renders metric-first company hierarchy with completed quality details', () => {
   const context = loadHooks({ pathname: '/bsd-warehouse/single/rp' });
   const container = { innerHTML: '' };
 
@@ -1018,25 +1018,68 @@ test('after-sale repair renders indented five-metric detail for each selected co
     },
   });
 
-  assert.equal((container.innerHTML.match(/class="company-detail"/g) || []).length, 2);
-  assert.equal((container.innerHTML.match(/↳\s*Anker/g) || []).length, 1);
-  assert.equal((container.innerHTML.match(/↳\s*Nothing/g) || []).length, 1);
+  const html = container.innerHTML;
+  const groupMetrics = Array.from(
+    html.matchAll(/<tbody class="company-metric-group" data-metric="(new|progress|done)">/g),
+    match => match[1],
+  );
+  assert.deepEqual(groupMetrics, ['new', 'progress', 'done']);
 
-  const ankerAt = container.innerHTML.indexOf('↳ Anker');
-  const nothingAt = container.innerHTML.indexOf('↳ Nothing');
-  assert.ok(ankerAt >= 0 && nothingAt > ankerAt);
-  const anker = container.innerHTML.slice(ankerAt, nothingAt);
-  const nothing = container.innerHTML.slice(nothingAt);
-  assert.match(anker, /新订单\s*<b>12<\/b>/);
-  assert.match(anker, /进行中\s*<b>4<\/b>/);
-  assert.match(anker, /已完成\s*<b>8<\/b>/);
-  assert.match(anker, /良品\s*<b>6（75\.0%）<\/b>/);
-  assert.match(anker, /不良品\s*<b>2（25\.0%）<\/b>/);
-  assert.match(nothing, /新订单\s*<b>18<\/b>/);
-  assert.match(nothing, /进行中\s*<b>5<\/b>/);
-  assert.match(nothing, /已完成\s*<b>13<\/b>/);
-  assert.match(nothing, /良品\s*<b>9（69\.2%）<\/b>/);
-  assert.match(nothing, /不良品\s*<b>4（30\.8%）<\/b>/);
+  const groupHtml = (metric) => {
+    const match = html.match(new RegExp(
+      `<tbody class="company-metric-group" data-metric="${metric}">([\\s\\S]*?)<\\/tbody>`,
+    ));
+    assert.ok(match, `missing ${metric} metric group`);
+    return match[1];
+  };
+  const hierarchyRows = (group) => Array.from(
+    group.matchAll(/<tr class="([^"]*(?:company-metric-row|company-quality-row)[^"]*)">([\s\S]*?)<\/tr>/g),
+    match => ({
+      classes: match[1].split(/\s+/),
+      text: match[2].replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim(),
+    }),
+  );
+
+  const newGroup = groupHtml('new');
+  const progressGroup = groupHtml('progress');
+  const doneGroup = groupHtml('done');
+  assert.match(newGroup, /新订单[\s\S]*30/);
+  assert.match(progressGroup, /进行中[\s\S]*9/);
+  assert.match(doneGroup, /已完成[\s\S]*21/);
+
+  const newRows = hierarchyRows(newGroup);
+  assert.deepEqual(newRows.map(row => row.classes), [
+    ['company-metric-row'],
+    ['company-metric-row'],
+  ]);
+  assert.match(newRows[0].text, /Anker.*12/);
+  assert.match(newRows[1].text, /Nothing.*18/);
+
+  const progressRows = hierarchyRows(progressGroup);
+  assert.deepEqual(progressRows.map(row => row.classes), [
+    ['company-metric-row'],
+    ['company-metric-row'],
+  ]);
+  assert.match(progressRows[0].text, /Anker.*4/);
+  assert.match(progressRows[1].text, /Nothing.*5/);
+
+  const doneRows = hierarchyRows(doneGroup);
+  assert.deepEqual(doneRows.map(row => row.classes), [
+    ['company-metric-row'],
+    ['company-quality-row', 'good'],
+    ['company-quality-row', 'bad'],
+    ['company-metric-row'],
+    ['company-quality-row', 'good'],
+    ['company-quality-row', 'bad'],
+  ]);
+  assert.match(doneRows[0].text, /Anker.*8/);
+  assert.match(doneRows[1].text, /良品.*6.*75\.0%/);
+  assert.match(doneRows[2].text, /不良品.*2.*25\.0%/);
+  assert.match(doneRows[3].text, /Nothing.*13/);
+  assert.match(doneRows[4].text, /良品.*9.*69\.2%/);
+  assert.match(doneRows[5].text, /不良品.*4.*30\.8%/);
+
+  assert.doesNotMatch(html, /class="company-detail(?:"|\s)/);
 });
 
 test('after-sale repair shows unavailable good and bad rates when no orders completed', () => {

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.10.2
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；工程师订单的 DOA/RP 页保留完成统计，售后服务维修页按公司和本地日期统计新订单、进行中、已完成及良品/不良品占比，多选公司时缩进显示各公司明细。中国时间可切换为本地时区显示，悬停显示原文。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
+// @version      1.10.3
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；工程师订单的 DOA/RP 页保留完成统计，售后服务维修页按公司和本地日期统计新订单、进行中、已完成及良品/不良品占比，多选公司时按指标缩进显示公司及品质明细。中国时间可切换为本地时区显示，悬停显示原文。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -386,20 +386,20 @@
       #${PANEL_ID} table.summary td.rate  { color: #515a6e; font-weight: 600; text-align: right; }
       #${PANEL_ID} table.summary td.good  { color: #19be6b; font-weight: 600; }
       #${PANEL_ID} table.summary td.bad   { color: #ed4014; font-weight: 600; }
-      #${PANEL_ID} .company-details { margin-top: 10px; }
-      #${PANEL_ID} .company-details-title { color: #515a6e; font-size: 12px; font-weight: 700; margin-bottom: 6px; }
-      #${PANEL_ID} .company-detail {
-        margin: 0 0 6px 14px; padding: 7px 9px;
-        border-left: 2px solid #d9e8ff; background: #fafbfc; border-radius: 0 4px 4px 0;
+      #${PANEL_ID} table.summary .company-metric-group + .company-metric-group > tr:first-child td {
+        border-top: 2px solid #e8eaec;
       }
-      #${PANEL_ID} .company-detail-name { color: #2d8cf0; font-size: 12px; font-weight: 700; margin-bottom: 5px; }
-      #${PANEL_ID} .company-detail-metrics {
-        display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 4px 8px;
-        color: #606266; font-size: 11.5px;
+      #${PANEL_ID} table.summary tr.company-metric-row td {
+        background: #fafbfc; color: #606266; font-size: 12px;
       }
-      #${PANEL_ID} .company-detail-metrics b { color: #17233d; }
-      #${PANEL_ID} .company-detail-metrics .good b { color: #19be6b; }
-      #${PANEL_ID} .company-detail-metrics .bad b { color: #ed4014; }
+      #${PANEL_ID} table.summary tr.company-quality-row td {
+        background: #fcfcfd; color: #808695; font-size: 11.5px;
+      }
+      #${PANEL_ID} table.summary tr.company-quality-row.good td { color: #19be6b; }
+      #${PANEL_ID} table.summary tr.company-quality-row.bad td { color: #ed4014; }
+      #${PANEL_ID} .company-indent { display: inline-block; }
+      #${PANEL_ID} .company-indent-1 { padding-left: 16px; color: #2d8cf0; font-weight: 600; }
+      #${PANEL_ID} .company-indent-2 { padding-left: 38px; }
       #${PANEL_ID} .err-tag { color: #ed4014; cursor: help; margin-left: 4px; }
 
       #${PANEL_ID} .empty    { color: #999;    padding: 12px; text-align: center; }
@@ -2450,24 +2450,49 @@
         <td class="rate${cls === 'good' || cls === 'bad' ? ` ${cls}` : ''}">${count}</td>
         <td class="rate${cls === 'good' || cls === 'bad' ? ` ${cls}` : ''}">${rate == null ? '—' : rate}</td>
       </tr>`;
-    const companyDetailHtml = companyDetails.map(detail => {
-      const s = detail.stats;
-      const detailUnclassified = Math.max(0, s.done - s.positive - s.negative);
-      return `
-        <div class="company-detail">
-          <div class="company-detail-name">↳ ${escapeHtml(detail.companyLabel)}</div>
-          <div class="company-detail-metrics">
-            <span>新订单 <b>${s.newOrders}</b></span>
-            <span>进行中 <b>${s.inProgress}</b></span>
-            <span>已完成 <b>${s.done}</b></span>
-            <span class="good">良品 <b>${s.positive}（${fmtRate(s.positive, s.done)}）</b></span>
-            <span class="bad">不良品 <b>${s.negative}（${fmtRate(s.negative, s.done)}）</b></span>
+    const companyMetricRow = (detail, count, rate = null) => `
+      <tr class="company-metric-row">
+        <td><span class="company-indent company-indent-1">↳ ${escapeHtml(detail.companyLabel)}</span></td>
+        <td class="rate">${count}</td>
+        <td class="rate">${rate == null ? '—' : rate}</td>
+      </tr>`;
+    const companyQualityRow = (label, count, rate, cls = '') => `
+      <tr class="company-quality-row${cls ? ` ${cls}` : ''}">
+        <td><span class="company-indent company-indent-2">↳ ${escapeHtml(label)}</span></td>
+        <td class="rate${cls ? ` ${cls}` : ''}">${count}</td>
+        <td class="rate${cls ? ` ${cls}` : ''}">${rate}</td>
+      </tr>`;
+    const companyMetricGroupHtml = companyDetails.length ? `
+      <tbody class="company-metric-group" data-metric="new">
+        ${metricRow('新订单', stats.newOrders)}
+        ${companyDetails.map(detail => companyMetricRow(detail, detail.stats.newOrders)).join('')}
+      </tbody>
+      <tbody class="company-metric-group" data-metric="progress">
+        ${metricRow('进行中', stats.inProgress)}
+        ${companyDetails.map(detail => companyMetricRow(detail, detail.stats.inProgress)).join('')}
+      </tbody>
+      <tbody class="company-metric-group" data-metric="done">
+        ${metricRow('已完成', stats.done, stats.done ? '100.0%' : '—', 'total')}
+        ${companyDetails.map(detail => {
+          const s = detail.stats;
+          const detailUnclassified = Math.max(0, s.done - s.positive - s.negative);
+          return `
+            ${companyMetricRow(detail, s.done, fmtRate(s.done, stats.done))}
+            ${companyQualityRow('良品', s.positive, fmtRate(s.positive, s.done), 'good')}
+            ${companyQualityRow('不良品', s.negative, fmtRate(s.negative, s.done), 'bad')}
             ${detailUnclassified
-              ? `<span>未分类 <b>${detailUnclassified}（${fmtRate(detailUnclassified, s.done)}）</b></span>`
-              : ''}
-          </div>
-        </div>`;
-    }).join('');
+              ? companyQualityRow('未分类', detailUnclassified, fmtRate(detailUnclassified, s.done))
+              : ''}`;
+        }).join('')}
+      </tbody>` : `
+      <tbody>
+        ${metricRow('新订单', stats.newOrders)}
+        ${metricRow('进行中', stats.inProgress)}
+        ${metricRow('已完成', stats.done, stats.done ? '100.0%' : '—', 'total')}
+        ${metricRow('良品', stats.positive, fmtRate(stats.positive, stats.done), 'good')}
+        ${metricRow('不良品', stats.negative, fmtRate(stats.negative, stats.done), 'bad')}
+        ${unclassified ? metricRow('未分类', unclassified, fmtRate(unclassified, stats.done)) : ''}
+      </tbody>`;
 
     container.innerHTML = `
       <div class="hint">
@@ -2479,21 +2504,9 @@
         各项按流程事件统计，不受订单之后的当前状态影响（已出库仍计入完成）。
       </div>
       <table class="summary">
-        <thead><tr><th>指标</th><th style="text-align:right">数量</th><th style="text-align:right">占已完成</th></tr></thead>
-        <tbody>
-          ${metricRow('新订单', stats.newOrders)}
-          ${metricRow('进行中', stats.inProgress)}
-          ${metricRow('已完成', stats.done, stats.done ? '100.0%' : '—', 'total')}
-          ${metricRow('良品', stats.positive, fmtRate(stats.positive, stats.done), 'good')}
-          ${metricRow('不良品', stats.negative, fmtRate(stats.negative, stats.done), 'bad')}
-          ${unclassified ? metricRow('未分类', unclassified, fmtRate(unclassified, stats.done)) : ''}
-        </tbody>
+        <thead><tr><th>指标</th><th style="text-align:right">数量</th><th style="text-align:right">${companyDetails.length ? '比例' : '占已完成'}</th></tr></thead>
+        ${companyMetricGroupHtml}
       </table>
-      ${companyDetails.length ? `
-        <div class="company-details">
-          <div class="company-details-title">公司明细（总计由以下公司相加）</div>
-          ${companyDetailHtml}
-        </div>` : ''}
     `;
   }
 
