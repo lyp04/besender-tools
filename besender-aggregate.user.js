@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.9.2
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
+// @version      1.9.3
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量及通过(良品)/不通过(不良品)数量与占比(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -1904,9 +1904,13 @@
 
   // 统计某一类型在页面本地时间窗口内的「完成」订单数：沿用页面筛选，强制覆盖
   // { status:完成, time_type, start, end, 类型字段 }，page/limit 仅取 meta.total。
-  async function countOrders(kind, baseQuery, timeType, winStart, winEnd) {
+  // perfectNum=null 统计全部完成订单；1/0 分别统计正向/负向结果。
+  async function countOrders(kind, baseQuery, timeType, winStart, winEnd, perfectNum = null) {
     const params = Object.assign({}, baseQuery);
     delete params.type; delete params.type_arr; delete params.is_child; // 类型按 kind 重设
+    // 结果分类必须由本次统计明确设置，不能继承陈旧筛选。
+    delete params.perfect_num;
+    delete params.un_perfect_num;
     // service_type is an RP-only filter. Carrying it into a cross-page DOA
     // request can silently filter every DOA order out.
     if (kind === 'doa') delete params.service_type;
@@ -1919,6 +1923,7 @@
       page:      1,
       limit:     1,
     });
+    if (perfectNum !== null) params.perfect_num = perfectNum;
     const resp = await apiGet(API.orderList, params);
     if (!resp || typeof resp !== 'object') {
       throw new Error('统计接口返回为空');
@@ -1934,6 +1939,20 @@
     // the total when pagination metadata is missing. Fail visibly instead of
     // reporting a plausible but incorrect 0 or 1.
     throw new Error('统计接口缺少有效的 meta.total');
+  }
+
+  async function countOrderStats(kind, baseQuery, timeType, winStart, winEnd) {
+    const [done, positive, negative] = await Promise.all([
+      countOrders(kind, baseQuery, timeType, winStart, winEnd),
+      countOrders(kind, baseQuery, timeType, winStart, winEnd, 1),
+      countOrders(kind, baseQuery, timeType, winStart, winEnd, 0),
+    ]);
+    // Fail visibly if the backend ever stops honoring perfect_num; otherwise
+    // both classification calls could equal the unfiltered total.
+    if (positive + negative > done) {
+      throw new Error('统计接口返回的良品/不良品分类数量不一致');
+    }
+    return { done, positive, negative };
   }
 
   async function runOrderCount(panel, kind) {
@@ -1960,9 +1979,9 @@
     body.innerHTML = '<div class="loading">查询中…</div>';
     try {
       const counts = { doa: null, rp: null };
-      counts[kind] = await countOrders(kind, base, timeType, dr.start, dr.end);
+      counts[kind] = await countOrderStats(kind, base, timeType, dr.start, dr.end);
       if (alsoOther) {
-        counts[other] = await countOrders(other, base, timeType, dr.start, dr.end);
+        counts[other] = await countOrderStats(other, base, timeType, dr.start, dr.end);
       }
       renderOrderCount(body, { dr, companyLabel, timeType, counts });
     } catch (err) {
@@ -1978,17 +1997,35 @@
     if (o.counts.doa != null) rows.push(['DOA', o.counts.doa]);
     if (o.counts.rp  != null) rows.push(['RP（维修）', o.counts.rp]);
     const showTotal = o.counts.doa != null && o.counts.rp != null;
-    const total = (o.counts.doa || 0) + (o.counts.rp || 0);
+    const total = rows.reduce((sum, r) => ({
+      done:     sum.done     + r[1].done,
+      positive: sum.positive + r[1].positive,
+      negative: sum.negative + r[1].negative,
+    }), { done: 0, positive: 0, negative: 0 });
+    const metricCell = (n, done, cls) =>
+      `<td class="${cls}" style="text-align:right">${n}（${fmtRate(n, done)}）</td>`;
+    const rowHtml = (label, stats, cls = '') => `
+      <tr${cls ? ` class="${cls}"` : ''}>
+        <td>${escapeHtml(label)}</td>
+        ${metricCell(stats.positive, stats.done, 'good')}
+        ${metricCell(stats.negative, stats.done, 'bad')}
+        <td class="rate">${stats.done}</td>
+      </tr>`;
     container.innerHTML = `
       <div class="hint">
         日期 <b>${escapeHtml(o.dr.start)}</b> ~ <b>${escapeHtml(o.dr.end)}</b>（按页面本地时间，不换算）<br>
         公司：<b>${escapeHtml(o.companyLabel)}</b>（沿用页面筛选）｜ 状态：<b>完成</b> ｜ 口径：<b>完成时间</b>
       </div>
       <table class="summary">
-        <thead><tr><th>类型</th><th style="text-align:right">完成数量</th></tr></thead>
+        <thead><tr>
+          <th>类型</th>
+          <th style="text-align:right">通过（良品）</th>
+          <th style="text-align:right">不通过（不良品）</th>
+          <th style="text-align:right">完成数量</th>
+        </tr></thead>
         <tbody>
-          ${rows.map(r => `<tr><td>${escapeHtml(r[0])}</td><td class="rate">${r[1]}</td></tr>`).join('')}
-          ${showTotal ? `<tr class="total"><td>合计 (DOA+RP)</td><td class="rate">${total}</td></tr>` : ''}
+          ${rows.map(r => rowHtml(r[0], r[1])).join('')}
+          ${showTotal ? rowHtml('合计 (DOA+RP)', total, 'total') : ''}
         </tbody>
       </table>
     `;

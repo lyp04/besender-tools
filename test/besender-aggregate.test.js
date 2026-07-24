@@ -9,10 +9,12 @@ const vm = require('node:vm');
 const sourcePath = path.join(__dirname, '..', 'besender-aggregate.user.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 
-function loadHooks({ response = null, rootVue = null, pathname = '/bsd-warehouse/engineerRepair' } = {}) {
+function loadHooks({ response = null, responses = null, rootVue = null, pathname = '/bsd-warehouse/engineerRepair' } = {}) {
   const apiStub = `  async function apiGet(path, params) {
     globalThis.__lastApiCall = { path, params };
-    return globalThis.__apiResponse;
+    globalThis.__apiCalls = globalThis.__apiCalls || [];
+    globalThis.__apiCalls.push({ path, params });
+    return globalThis.__apiResponses ? globalThis.__apiResponses.shift() : globalThis.__apiResponse;
   }
 
   // ── Floating action button`;
@@ -30,7 +32,9 @@ function loadHooks({ response = null, rootVue = null, pathname = '/bsd-warehouse
     localTodayStr,
     pageLocalTodayStr,
     countOrders,
+    countOrderStats,
     readOrderPageQuery,
+    renderOrderCount,
     runOrderCount,
   };
   return;
@@ -68,6 +72,7 @@ ${bootMarker}`,
     Date: FixedDate,
     Intl: { DateTimeFormat: MockDateTimeFormat },
     __apiResponse: response,
+    __apiResponses: responses ? responses.slice() : null,
     document: {
       querySelector: (selector) => selector === '#app' && rootVue ? { __vue__: rootVue } : null,
     },
@@ -170,7 +175,10 @@ test('order counts use meta.total and remove RP-only filters from DOA', async ()
 
   const total = await context.__testHooks.countOrders(
     'doa',
-    { page: 9, limit: 10, type_arr: '1,2', is_child: 0, service_type: 'mail', user_id: 7 },
+    {
+      page: 9, limit: 10, type_arr: '1,2', is_child: 0, service_type: 'mail',
+      user_id: 7, perfect_num: 1, un_perfect_num: 1,
+    },
     '2',
     '2026-07-01 00:00:00',
     '2026-07-01 23:59:59',
@@ -186,6 +194,96 @@ test('order counts use meta.total and remove RP-only filters from DOA', async ()
   assert.equal('type_arr' in context.__lastApiCall.params, false);
   assert.equal('is_child' in context.__lastApiCall.params, false);
   assert.equal('service_type' in context.__lastApiCall.params, false);
+  assert.equal('perfect_num' in context.__lastApiCall.params, false);
+  assert.equal('un_perfect_num' in context.__lastApiCall.params, false);
+});
+
+test('order result counts preserve perfect_num zero and all page filters', async () => {
+  const context = loadHooks({ response: { code: 200, data: [{}], meta: { total: 3 } } });
+
+  const total = await context.__testHooks.countOrders(
+    'rp',
+    { user_id: 119, keyword: 'phone', perfect_num: 1 },
+    '2',
+    '2026-07-01 00:00:00',
+    '2026-07-01 23:59:59',
+    0,
+  );
+
+  assert.equal(total, 3);
+  assert.equal(context.__lastApiCall.params.perfect_num, 0);
+  assert.equal(context.__lastApiCall.params.user_id, 119);
+  assert.equal(context.__lastApiCall.params.keyword, 'phone');
+  assert.equal(context.__lastApiCall.params.type_arr, '1,2');
+  assert.equal(context.__lastApiCall.params.status, '2');
+});
+
+test('order stats combine completed, positive, and negative totals', async () => {
+  const context = loadHooks({ responses: [
+    { code: 200, data: [{}], meta: { total: 10 } },
+    { code: 200, data: [{}], meta: { total: 7 } },
+    { code: 200, data: [{}], meta: { total: 3 } },
+  ] });
+
+  const stats = await context.__testHooks.countOrderStats(
+    'rp', { user_id: 119 }, '2', '2026-07-01 00:00:00', '2026-07-01 23:59:59',
+  );
+
+  assert.deepEqual({ ...stats }, { done: 10, positive: 7, negative: 3 });
+  assert.equal(context.__apiCalls.length, 3);
+  assert.equal('perfect_num' in context.__apiCalls[0].params, false);
+  assert.equal(context.__apiCalls[1].params.perfect_num, 1);
+  assert.equal(context.__apiCalls[2].params.perfect_num, 0);
+});
+
+test('order stats reject classification totals larger than completed orders', async () => {
+  const context = loadHooks({ responses: [
+    { code: 200, data: [{}], meta: { total: 10 } },
+    { code: 200, data: [{}], meta: { total: 10 } },
+    { code: 200, data: [{}], meta: { total: 10 } },
+  ] });
+
+  await assert.rejects(
+    context.__testHooks.countOrderStats(
+      'rp', {}, '2', '2026-07-01 00:00:00', '2026-07-01 23:59:59',
+    ),
+    /分类数量不一致/,
+  );
+});
+
+test('order stats render positive and negative counts, percentages, and totals', () => {
+  const context = loadHooks();
+  const container = { innerHTML: '' };
+
+  context.__testHooks.renderOrderCount(container, {
+    dr: { start: '2026-07-01 00:00:00', end: '2026-07-01 23:59:59' },
+    companyLabel: 'Nothing',
+    counts: {
+      doa: { done: 10, positive: 7, negative: 3 },
+      rp: { done: 20, positive: 10, negative: 10 },
+    },
+  });
+
+  assert.match(container.innerHTML, /通过（良品）/);
+  assert.match(container.innerHTML, /不通过（不良品）/);
+  assert.match(container.innerHTML, /7（70\.0%）/);
+  assert.match(container.innerHTML, /3（30\.0%）/);
+  assert.match(container.innerHTML, /17（56\.7%）/);
+  assert.match(container.innerHTML, /13（43\.3%）/);
+  assert.match(container.innerHTML, /合计 \(DOA\+RP\)/);
+});
+
+test('order stats show an em dash percentage when completed count is zero', () => {
+  const context = loadHooks();
+  const container = { innerHTML: '' };
+
+  context.__testHooks.renderOrderCount(container, {
+    dr: { start: '2026-07-01 00:00:00', end: '2026-07-01 23:59:59' },
+    companyLabel: 'Nothing',
+    counts: { doa: null, rp: { done: 0, positive: 0, negative: 0 } },
+  });
+
+  assert.equal((container.innerHTML.match(/0（—）/g) || []).length, 2);
 });
 
 test('RP order count inherits the company from the visible RP filter component', async () => {
