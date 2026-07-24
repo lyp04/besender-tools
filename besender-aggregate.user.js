@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.9.4
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量及通过(良品)/不通过(不良品)数量与占比(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
+// @version      1.10.0
+// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在维修(RP)页按公司和本地日期统计新订单、进行中、已完成及良品/不良品占比，在 DOA 页统计完成订单。中国时间可切换为本地时区显示，悬停显示原文。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
 // @run-at       document-idle
@@ -104,6 +104,8 @@
 
   // Timezone the user is viewing the data in. Persisted across page loads.
   const TZ_STORAGE_KEY = 'bsd-agg-tz';
+  const ORDER_TZ_STORAGE_KEY = 'bsd-agg-order-tz';
+  const ORDER_DEFAULT_TZ = 'America/Los_Angeles';
   const TZ_OPTIONS = [
     ['美东',     'America/New_York'],
     ['美中',     'America/Chicago'],
@@ -116,7 +118,12 @@
     try { return localStorage.getItem(TZ_STORAGE_KEY) || ''; }
     catch (_) { return ''; }
   })();
+  let orderUserTZ = (() => {
+    try { return localStorage.getItem(ORDER_TZ_STORAGE_KEY) || ''; }
+    catch (_) { return ''; }
+  })();
   function localTZ() { return userTZ || systemTZ(); }
+  function orderStatsTZ() { return orderUserTZ || ORDER_DEFAULT_TZ; }
   function setUserTZ(tz) {
     userTZ = tz || '';
     try {
@@ -124,22 +131,29 @@
       else        localStorage.removeItem(TZ_STORAGE_KEY);
     } catch (_) {}
   }
-  function buildTzOptionsHtml() {
+  function setOrderStatsTZ(tz) {
+    orderUserTZ = tz || ORDER_DEFAULT_TZ;
+    try { localStorage.setItem(ORDER_TZ_STORAGE_KEY, orderUserTZ); } catch (_) {}
+  }
+  function buildTzOptionsHtml(selectedTZ = localTZ()) {
     const sys = systemTZ();
     const list = TZ_OPTIONS.map(([label, tz]) => ({ label, tz }));
     if (!list.find(o => o.tz === sys)) {
       list.unshift({ label: `系统 (${sys})`, tz: sys });
     }
-    const selected = localTZ();
+    const selected = selectedTZ || sys;
+    if (!list.find(o => o.tz === selected)) {
+      list.unshift({ label: selected, tz: selected });
+    }
     return list.map(o =>
       `<option value="${escapeHtml(o.tz)}"${o.tz === selected ? ' selected' : ''}>${escapeHtml(o.label)}</option>`
     ).join('');
   }
   // Re-render every already-decorated <span class="bsd-agg-time"> when the
   // active timezone changes.
-  function relabelDecoratedTimes() {
-    const tz = localTZ();
+  function relabelDecoratedTimes(tz = localTZ(), tzScope = null) {
     document.querySelectorAll('.' + TIME_CLS).forEach(el => {
+      if (tzScope && el.dataset.tzScope !== tzScope) return;
       const china = el.dataset.china;
       if (!china) return;
       const utc = parseServerTime(china);
@@ -148,19 +162,63 @@
     });
   }
 
-  // For a local-calendar date "YYYY-MM-DD" return [chinaStartStr, chinaEndStr] covering that
-  // 24-hour window. Returned strings are in server format "YYYY-MM-DD HH:mm:ss" (Asia/Shanghai).
-  function localDateToChinaRange(localDateStr) {
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(localDateStr).trim());
+  function parseCalendarDate(value) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(value || '').trim());
     if (!m) return null;
-    const [, Y, Mo, D] = m.map(Number);
-    // Build the local-day UTC bounds.
-    const tz = localTZ();
-    // Strategy: compute the UTC instant of local midnight by trial: use Date and TZ offset at that day.
-    // We construct a "naive" date at midnight in the local TZ via Intl reverse-lookup.
-    const localStartUTC = localWallToUTC(Y, Mo, D, 0, 0, 0, tz);
-    const localEndUTC   = new Date(localStartUTC.getTime() + 24 * 3600 * 1000 - 1000); // -1s to stay within the day
-    return [fmtInTZ(localStartUTC, SERVER_TZ), fmtInTZ(localEndUTC, SERVER_TZ)];
+    const Y = Number(m[1]);
+    const Mo = Number(m[2]);
+    const D = Number(m[3]);
+    const check = new Date(Date.UTC(Y, Mo - 1, D));
+    if (check.getUTCFullYear() !== Y || check.getUTCMonth() !== Mo - 1 || check.getUTCDate() !== D) {
+      return null;
+    }
+    return { Y, Mo, D, value: `${m[1]}-${m[2]}-${m[3]}` };
+  }
+
+  // Shift a calendar date without using a fixed 24-hour timezone duration. This
+  // remains correct across the spring-forward and fall-back DST boundaries.
+  function calendarDateOffset(dateStr, days) {
+    const p = parseCalendarDate(dateStr);
+    if (!p) return null;
+    const shifted = new Date(Date.UTC(p.Y, p.Mo - 1, p.D + Number(days || 0)));
+    return `${shifted.getUTCFullYear()}-${String(shifted.getUTCMonth() + 1).padStart(2, '0')}-${String(shifted.getUTCDate()).padStart(2, '0')}`;
+  }
+
+  // Interpret an inclusive calendar-date range in `tz`, then express the exact
+  // same instants as Asia/Shanghai wall-clock strings for the order API. The end
+  // is calculated from the next local midnight (not start + 24h), so 23/25-hour
+  // DST days are covered exactly once.
+  function zonedDateRangeToChinaWindow(startDate, endDate, tz) {
+    const a = parseCalendarDate(startDate);
+    const b = parseCalendarDate(endDate);
+    if (!a || !b || !tz) return null;
+    const start = a.value <= b.value ? a.value : b.value;
+    const end = a.value <= b.value ? b.value : a.value;
+    const sp = parseCalendarDate(start);
+    const nextEnd = calendarDateOffset(end, 1);
+    const ep = parseCalendarDate(nextEnd);
+    if (!sp || !ep) return null;
+    try {
+      const startUTC = localWallToUTC(sp.Y, sp.Mo, sp.D, 0, 0, 0, tz);
+      const endExclusiveUTC = localWallToUTC(ep.Y, ep.Mo, ep.D, 0, 0, 0, tz);
+      const endUTC = new Date(endExclusiveUTC.getTime() - 1000);
+      return {
+        label: start === end ? start : `${start} ~ ${end}`,
+        timezone: tz,
+        localStart: `${start} 00:00:00`,
+        localEnd: `${end} 23:59:59`,
+        chinaStart: fmtInTZ(startUTC, SERVER_TZ),
+        chinaEnd: fmtInTZ(endUTC, SERVER_TZ),
+      };
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // For a local-calendar date return the matching Asia/Shanghai API window.
+  function localDateToChinaRange(localDateStr, tz = localTZ()) {
+    const r = zonedDateRangeToChinaWindow(localDateStr, localDateStr, tz);
+    return r ? [r.chinaStart, r.chinaEnd] : null;
   }
 
   // Given wall-clock components in an IANA timezone, return the corresponding UTC Date.
@@ -198,23 +256,19 @@
     return fmtInTZ(now, tz).slice(0, 10);
   }
 
-  // DOA/RP pages already display and filter timestamps in the browser's local
-  // timezone. Their default date must therefore ignore the timezone persisted
-  // by the other (China-time) statistics panels. Otherwise, a user who selected
-  // Asia/Shanghai there can open DOA/RP in America and default to tomorrow.
+  function orderStatsTodayStr() {
+    return fmtInTZ(new Date(), orderStatsTZ()).slice(0, 10);
+  }
+
+  // DOA keeps its historical page-local date behavior. RP has a separate,
+  // explicit reporting timezone because its raw list timestamps are China time.
   function pageLocalTodayStr() {
     return fmtInTZ(new Date(), systemTZ()).slice(0, 10);
   }
 
-  // Shift a local-calendar date "YYYY-MM-DD" by `days` and return the new
-  // local-calendar date string, in the user's active timezone.
+  // Shift a local-calendar date "YYYY-MM-DD" by `days`.
   function localDateOffset(localDateStr, days) {
-    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(localDateStr || '').trim());
-    if (!m) return localDateStr;
-    const tz   = localTZ();
-    const utc  = localWallToUTC(+m[1], +m[2], +m[3], 0, 0, 0, tz);
-    const next = new Date(utc.getTime() + days * 24 * 3600 * 1000);
-    return fmtInTZ(next, tz).slice(0, 10);
+    return calendarDateOffset(localDateStr, days) || localDateStr;
   }
 
   // ── Styles ──────────────────────────────────────────────────────────────
@@ -324,9 +378,9 @@
       #${PANEL_ID} table.summary th { background: #f5f7fa; font-weight: 600; }
       #${PANEL_ID} table.summary tr.total td { background: #fff7e6; font-weight: 700; }
       #${PANEL_ID} table.summary tr.err-row td { background: #fff7ed; }
+      #${PANEL_ID} table.summary td.rate  { color: #515a6e; font-weight: 600; text-align: right; }
       #${PANEL_ID} table.summary td.good  { color: #19be6b; font-weight: 600; }
       #${PANEL_ID} table.summary td.bad   { color: #ed4014; font-weight: 600; }
-      #${PANEL_ID} table.summary td.rate  { color: #515a6e; font-weight: 600; text-align: right; }
       #${PANEL_ID} .err-tag { color: #ed4014; cursor: help; margin-left: 4px; }
 
       #${PANEL_ID} .empty    { color: #999;    padding: 12px; text-align: center; }
@@ -531,7 +585,7 @@
   function fabLabelFor(kind) {
     if (kind === 'inbound') return '🔍 物料/机型搜索';
     if (kind === 'doa')     return '📊 DOA 完成统计';
-    if (kind === 'rp')      return '📊 RP 完成统计';
+    if (kind === 'rp')      return '📊 维修订单统计';
     return '📊 良品/不良品聚合';
   }
 
@@ -641,7 +695,7 @@
     const tzSelect = panel.querySelector('.tz-select');
     tzSelect.addEventListener('change', () => {
       setUserTZ(tzSelect.value);
-      relabelDecoratedTimes();
+      relabelDecoratedTimes(localTZ(), 'general');
       // Detail panel re-queries automatically (date interpretation changed).
       // List panel keeps the previously-rendered summary until the user clicks 查询 again.
       if (panel.dataset.panelKind === 'detail') {
@@ -1609,25 +1663,40 @@
 
   // ── Page-2 timestamp decoration (China time → local + hover tooltip) ────
 
+  function textHasTimestamp(value) {
+    TIME_RE.lastIndex = 0;
+    const found = TIME_RE.test(String(value || ''));
+    TIME_RE.lastIndex = 0;
+    return found;
+  }
+
+  function isVisibleTimestampParent(el) {
+    if (!el || el.nodeType !== 1) return false;
+    try {
+      return typeof el.getClientRects !== 'function' || el.getClientRects().length > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
   function decorateTimestamps(scope) {
-    // DOA / 维修(RP) 页面展示的时间本身就是本地时间，不能再按中国时间换算装饰；
-    // 这里直接跳过(兼顾从其它页面 SPA 跳转过来后仍在运行的旧 observer)。
+    // DOA retains its historical page-local behavior. Live inspection confirms
+    // that the RP list renders raw China wall-clock timestamps, so RP is converted
+    // to its explicit reporting timezone just like the other China-time pages.
     const pk = pageKind();
-    if (pk === 'doa' || pk === 'rp') return;
-    // Walk text nodes inside scope; wrap any "YYYY-MM-DD HH:mm:ss" in a span.
-    // We mark each rewritten parent with data-bsd-decorated so we don't reprocess it.
+    if (!['list', 'detail', 'inbound', 'rp'].includes(pk)) return;
+    // Walk text nodes inside scope and wrap each raw timestamp in a marker span.
+    // Marker spans are skipped, while later Vue text replacements remain eligible.
     const root = scope || document.body;
     if (!root || root.nodeType !== 1) return;
 
     const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
-        if (!node.nodeValue || !TIME_RE.test(node.nodeValue)) {
-          TIME_RE.lastIndex = 0;
-          return NodeFilter.FILTER_REJECT;
-        }
-        TIME_RE.lastIndex = 0;
+        if (!textHasTimestamp(node.nodeValue)) return NodeFilter.FILTER_REJECT;
         const p = node.parentNode;
-        if (!p || p.nodeType !== 1) return NodeFilter.FILTER_REJECT;
+        // Vue keep-alive leaves inactive route trees connected under display:none.
+        // Never classify those nodes using the currently-active page's timezone.
+        if (!isVisibleTimestampParent(p)) return NodeFilter.FILTER_REJECT;
         if (p.closest && p.closest(`#${PANEL_ID}, #${FAB_ID}, #${TIP_ID}`)) {
           return NodeFilter.FILTER_REJECT;
         }
@@ -1636,7 +1705,6 @@
           return NodeFilter.FILTER_REJECT;
         }
         if (p.classList && p.classList.contains(TIME_CLS)) return NodeFilter.FILTER_REJECT;
-        if (p.dataset && p.dataset.bsdDecorated === '1') return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       }
     });
@@ -1644,7 +1712,8 @@
     const targets = [];
     while (walker.nextNode()) targets.push(walker.currentNode);
 
-    const tz = localTZ();
+    const tz = pk === 'rp' ? orderStatsTZ() : localTZ();
+    const tzScope = pk === 'rp' ? 'order' : 'general';
     for (const node of targets) {
       const text = node.nodeValue;
       const frag = document.createDocumentFragment();
@@ -1658,6 +1727,7 @@
         span.className   = TIME_CLS;
         span.dataset.china = match;
         span.dataset.localTz = tz;
+        span.dataset.tzScope = tzScope;
         span.textContent = local;
         frag.appendChild(span);
         last = idx + match.length;
@@ -1669,7 +1739,6 @@
       const p = node.parentNode;
       if (p) {
         p.replaceChild(frag, node);
-        if (p.dataset) p.dataset.bsdDecorated = '1';
       }
     }
   }
@@ -1716,31 +1785,23 @@
     });
   }
 
+  let timestampObserver = null;
+
   function watchForTimestamps() {
     decorateTimestamps(document.body);
+    if (timestampObserver) return;
     let pending = null;
-    const observer = new MutationObserver((mutations) => {
-      if (pending) return;
+    timestampObserver = new MutationObserver(() => {
+      if (pending) clearTimeout(pending);
       pending = setTimeout(() => {
         pending = null;
-        for (const mu of mutations) {
-          if (mu.type === 'childList') {
-            mu.addedNodes.forEach(n => {
-              if (n.nodeType === 1) decorateTimestamps(n);
-              else if (n.nodeType === 3) {
-                if (TIME_RE.test(n.nodeValue || '')) decorateTimestamps(n.parentNode || document.body);
-                TIME_RE.lastIndex = 0;
-              }
-            });
-          } else if (mu.type === 'characterData') {
-            const t = mu.target;
-            if (t && TIME_RE.test(t.nodeValue || '')) decorateTimestamps(t.parentNode || document.body);
-            TIME_RE.lastIndex = 0;
-          }
-        }
+        // Scan the current visible page after the mutation burst settles. This
+        // cannot lose a later observer batch, unlike retaining only the first
+        // batch while a timer is pending.
+        decorateTimestamps(document.body);
       }, 120);
     });
-    observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+    timestampObserver.observe(document.body, { childList: true, subtree: true, characterData: true });
   }
 
   // ── Misc helpers ────────────────────────────────────────────────────────
@@ -1751,16 +1812,19 @@
       .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
 
-  // ── DOA / 维修(RP) 完成订单统计 ─────────────────────────────────────────
+  // ── DOA / 维修(RP) 订单统计 ─────────────────────────────────────────────
   //
   // engineerDoa 与 engineerRepair 列表页共用 /engineer/afterSale/orderList。
-  // 面板按页面本地日期（单日/区间）直接构造查询窗口，统计「完成」状态订单数量；
-  // 公司及关键字等条件沿用页面顶部自带的搜索筛选（读取其 query）。
+  // RP 页把所选统计时区的自然日换算成中国时间 API 窗口；新订单与进行中按
+  // 开始时间统计，完成及良品/不良品按完成时间统计。公司等条件沿用页面筛选。
+  // DOA 页保留原有的完成统计与页面本地日期口径。
   // DOA 页可勾选「同时统计 RP」、RP 页可勾选「同时统计 DOA」，给出 DOA+RP 合计。
 
-  // 订单工作流状态：'1' 进行中 / '2' 完成。本功能始终统计「完成」。
+  // 订单工作流状态：'1' 进行中 / '2' 完成。
+  const OC_STATUS_PROGRESS = '1';
   const OC_STATUS_DONE = '2';
-  // time_type：'2' 完成时间(本功能固定按完成时间统计)。
+  // 页面时间类型：'1' 开始时间 / '2' 完成时间 / '3' 更新时间。
+  const OC_TIME_START = '1';
   const OC_TIME_COMPLETION = '2';
   // 各页订单类型筛选(取自各自页面 query 对象)。
   const OC_TYPE = {
@@ -1769,25 +1833,70 @@
   };
   const OC_LABEL = { doa: 'DOA', rp: 'RP（维修）' };
 
-  // DOA/RP 的时间是本地时间、与页面自带筛选口径一致，所以日期直接构造
-  // [00:00:00, 23:59:59] 窗口，不做任何时区换算。返回 {label, start, end}。
+  // Read the selected inclusive calendar range. RP dates are interpreted in the
+  // explicit statistics timezone and converted to the China-time API window.
+  // DOA retains the existing page-local direct-string behavior.
   function readOrderDateRange(panel) {
     const mode = panel.dataset.dateMode || 'single';
-    if (mode === 'single') {
-      const d = panel.querySelector('.date-input').value;
-      if (!d) return null;
-      return { label: d, start: d + ' 00:00:00', end: d + ' 23:59:59' };
-    }
-    const a = panel.querySelector('.date-start').value;
-    const b = panel.querySelector('.date-end').value;
+    const a = mode === 'single'
+      ? panel.querySelector('.date-input').value
+      : panel.querySelector('.date-start').value;
+    const b = mode === 'single'
+      ? a
+      : panel.querySelector('.date-end').value;
     if (!a || !b) return null;
     const s = a <= b ? a : b;
     const e = a <= b ? b : a;
-    return { label: `${s} ~ ${e}`, start: s + ' 00:00:00', end: e + ' 23:59:59' };
+    const kind = panel.dataset.panelKind || pageKind();
+    if (kind === 'rp') {
+      const tzSelect = panel.querySelector('.tz-select');
+      const tz = (tzSelect && tzSelect.value) || orderStatsTZ();
+      const win = zonedDateRangeToChinaWindow(s, e, tz);
+      return win ? Object.assign({}, win, { start: win.chinaStart, end: win.chinaEnd }) : null;
+    }
+    const start = `${s} 00:00:00`;
+    const end = `${e} 23:59:59`;
+    return {
+      label: s === e ? s : `${s} ~ ${e}`,
+      timezone: systemTZ(),
+      localStart: start,
+      localEnd: end,
+      start,
+      end,
+    };
+  }
+
+  // The two list pages historically accept different wall-clock query windows:
+  // RP uses China-time strings while DOA keeps page-local strings. Cross-counts
+  // must therefore derive each target's window from the same selected local day
+  // instead of reusing the primary page's API parameters verbatim.
+  function orderWindowForKind(dr, kind) {
+    if (!dr) return null;
+    const localStart = dr.localStart || dr.start;
+    const localEnd = dr.localEnd || dr.end;
+    if (!localStart || !localEnd) return null;
+    const converted = zonedDateRangeToChinaWindow(
+      String(localStart).slice(0, 10),
+      String(localEnd).slice(0, 10),
+      dr.timezone || systemTZ(),
+    );
+    if (!converted) return null;
+    if (kind === 'rp') {
+      return { start: converted.chinaStart, end: converted.chinaEnd };
+    }
+    if (kind === 'doa') {
+      const startUTC = parseServerTime(converted.chinaStart);
+      const endUTC = parseServerTime(converted.chinaEnd);
+      return startUTC && endUTC
+        ? { start: fmtInTZ(startUTC, systemTZ()), end: fmtInTZ(endUTC, systemTZ()) }
+        : null;
+    }
+    return null;
   }
 
   function openOrderCountPanel(kind) {
-    const today = pageLocalTodayStr();
+    const isRepair = kind === 'rp';
+    const today = isRepair ? orderStatsTodayStr() : pageLocalTodayStr();
     const other = kind === 'doa' ? 'rp' : 'doa';
     const panel = document.createElement('div');
     panel.id = PANEL_ID;
@@ -1795,10 +1904,12 @@
     panel.dataset.dateMode  = 'single';
     panel.innerHTML = `
       <header>
-        <span class="title">${OC_LABEL[kind]} 完成统计</span>
+        <span class="title">${isRepair ? '维修服务订单统计' : (OC_LABEL[kind] + ' 完成统计')}</span>
         <span class="close" title="关闭">✕</span>
       </header>
-      <div class="body"><div class="empty">选择日期后点「查询」。公司及其余条件沿用页面顶部筛选，状态固定为「完成」。</div></div>
+      <div class="body"><div class="empty">${isRepair
+        ? '选择日期后点「查询」。公司及其余条件沿用页面顶部筛选；新订单、进行中按开始时间，已完成按完成时间。'
+        : '选择日期后点「查询」。公司及其余条件沿用页面顶部筛选，状态固定为「完成」。'}</div></div>
       <footer>
         <div class="date-controls">
           <div class="mode-tabs" role="tablist">
@@ -1806,7 +1917,7 @@
             <button class="mode-tab"        data-mode="range"  role="tab">区间</button>
           </div>
           <div class="date-fields single">
-            <label class="date-label">日期</label>
+            <label class="date-label">${isRepair ? '本地日期' : '日期'}</label>
             <input type="date" class="date-input" value="${today}">
           </div>
           <div class="date-fields range" style="display:none">
@@ -1815,6 +1926,10 @@
             <label class="date-label">到</label>
             <input type="date" class="date-end"   value="${today}">
           </div>
+          ${isRepair ? `
+            <label class="date-label tz-label">统计时区</label>
+            <select class="tz-select">${buildTzOptionsHtml(orderStatsTZ())}</select>
+          ` : ''}
         </div>
         <div class="footer-actions">
           <label class="date-label" style="display:flex;align-items:center;gap:4px;cursor:pointer">
@@ -1826,6 +1941,16 @@
       </footer>
     `;
     panel.querySelector('.close').addEventListener('click', () => destroyPanel(panel));
+
+    if (isRepair) {
+      const tzSelect = panel.querySelector('.tz-select');
+      tzSelect.addEventListener('change', () => {
+        setOrderStatsTZ(tzSelect.value);
+        relabelDecoratedTimes(orderStatsTZ(), 'order');
+        panel.querySelector('.body').innerHTML =
+          '<div class="empty">统计时区已更改；页面时间已同步，请重新点「查询」。</div>';
+      });
+    }
 
     // 单日 / 区间 切换。
     const tabs   = panel.querySelectorAll('.mode-tab');
@@ -1902,13 +2027,17 @@
     return found ? (found.company || found.cn_company || ('公司 ' + id)) : ('公司 ' + id);
   }
 
-  // 统计某一类型在页面本地时间窗口内的「完成」订单数：沿用页面筛选，强制覆盖
-  // { status:完成, time_type, start, end, 类型字段 }，page/limit 仅取 meta.total。
-  // perfectNum=null 统计全部完成订单；1/0 分别统计正向/负向结果。
-  async function countOrders(kind, baseQuery, timeType, winStart, winEnd, perfectNum = null) {
+  // Count one order metric from pagination meta.total. Every metric explicitly
+  // replaces status/time/result filters inherited from the visible page, so its
+  // result cannot be narrowed by a stale UI selection.
+  async function countOrders(kind, baseQuery, options) {
+    const o = options || {};
     const params = Object.assign({}, baseQuery);
     delete params.type; delete params.type_arr; delete params.is_child; // 类型按 kind 重设
-    // 结果分类必须由本次统计明确设置，不能继承陈旧筛选。
+    delete params.status;
+    delete params.time_type;
+    delete params.start;
+    delete params.end;
     delete params.perfect_num;
     delete params.un_perfect_num;
     // service_type is an RP-only filter. Carrying it into a cross-page DOA
@@ -1916,14 +2045,15 @@
     if (kind === 'doa') delete params.service_type;
     delete params.page; delete params.limit;
     Object.assign(params, OC_TYPE[kind], {
-      status:    OC_STATUS_DONE,
-      time_type: timeType,
-      start:     winStart,
-      end:       winEnd,
+      time_type: o.timeType,
+      start:     o.start,
+      end:       o.end,
       page:      1,
       limit:     1,
     });
-    if (perfectNum !== null) params.perfect_num = perfectNum;
+    // status=null means all workflow states and is how "new orders" is defined.
+    if (o.status !== null && o.status !== undefined && o.status !== '') params.status = o.status;
+    if (o.perfectNum !== null && o.perfectNum !== undefined) params.perfect_num = o.perfectNum;
     const resp = await apiGet(API.orderList, params);
     if (!resp || typeof resp !== 'object') {
       throw new Error('统计接口返回为空');
@@ -1942,10 +2072,16 @@
   }
 
   async function countOrderStats(kind, baseQuery, timeType, winStart, winEnd) {
+    const baseOptions = {
+      status: OC_STATUS_DONE,
+      timeType,
+      start: winStart,
+      end: winEnd,
+    };
     const [done, positive, negative] = await Promise.all([
-      countOrders(kind, baseQuery, timeType, winStart, winEnd),
-      countOrders(kind, baseQuery, timeType, winStart, winEnd, 1),
-      countOrders(kind, baseQuery, timeType, winStart, winEnd, 0),
+      countOrders(kind, baseQuery, baseOptions),
+      countOrders(kind, baseQuery, Object.assign({}, baseOptions, { perfectNum: 1 })),
+      countOrders(kind, baseQuery, Object.assign({}, baseOptions, { perfectNum: 0 })),
     ]);
     // Fail visibly if the backend ever stops honoring perfect_num; otherwise
     // both classification calls could equal the unfiltered total.
@@ -1955,13 +2091,37 @@
     return { done, positive, negative };
   }
 
+  async function countRepairStats(baseQuery, winStart, winEnd) {
+    const started = { timeType: OC_TIME_START, start: winStart, end: winEnd };
+    const completed = {
+      status: OC_STATUS_DONE,
+      timeType: OC_TIME_COMPLETION,
+      start: winStart,
+      end: winEnd,
+    };
+    const [newOrders, inProgress, done, positive, negative] = await Promise.all([
+      countOrders('rp', baseQuery, Object.assign({ status: null }, started)),
+      countOrders('rp', baseQuery, Object.assign({ status: OC_STATUS_PROGRESS }, started)),
+      countOrders('rp', baseQuery, completed),
+      countOrders('rp', baseQuery, Object.assign({}, completed, { perfectNum: 1 })),
+      countOrders('rp', baseQuery, Object.assign({}, completed, { perfectNum: 0 })),
+    ]);
+    if (positive + negative > done) {
+      throw new Error('统计接口返回的良品/不良品分类数量不一致');
+    }
+    return { newOrders, inProgress, done, positive, negative };
+  }
+
   async function runOrderCount(panel, kind) {
     const body    = panel.querySelector('.body');
     const run     = panel.querySelector('.run');
     const crossCb = panel.querySelector('.cross-cb');
 
-    const dr = readOrderDateRange(panel);   // 日期直接用，不做时区换算
+    const dr = readOrderDateRange(panel);
     if (!dr) { flash(body, '请选择有效日期'); return; }
+    const rpWindow = orderWindowForKind(dr, 'rp');
+    const doaWindow = orderWindowForKind(dr, 'doa');
+    if (!rpWindow || !doaWindow) { flash(body, '无法换算所选日期的统计窗口'); return; }
 
     const base = readOrderPageQuery(kind);
     if (!base) {
@@ -1971,28 +2131,105 @@
     flattenParams(base);
     const companyId    = base.user_id != null ? base.user_id : '';
     const companyLabel = companyNameById(companyId);
-    const timeType  = OC_TIME_COMPLETION;   // 口径固定为完成时间
+    const timeType  = OC_TIME_COMPLETION;
     const alsoOther = !!(crossCb && crossCb.checked);
-    const other     = kind === 'doa' ? 'rp' : 'doa';
 
     run.disabled = true;
     body.innerHTML = '<div class="loading">查询中…</div>';
     try {
       const counts = { doa: null, rp: null };
-      counts[kind] = await countOrderStats(kind, base, timeType, dr.start, dr.end);
-      if (alsoOther) {
-        counts[other] = await countOrderStats(other, base, timeType, dr.start, dr.end);
+      if (kind === 'rp') {
+        counts.rp = await countRepairStats(base, rpWindow.start, rpWindow.end);
+        if (alsoOther) {
+          counts.doa = await countOrderStats('doa', base, timeType, doaWindow.start, doaWindow.end);
+        }
+      } else {
+        counts.doa = await countOrderStats('doa', base, timeType, doaWindow.start, doaWindow.end);
+        if (alsoOther) {
+          counts.rp = await countOrderStats('rp', base, timeType, rpWindow.start, rpWindow.end);
+        }
       }
       renderOrderCount(body, { kind, dr, companyLabel, timeType, counts });
     } catch (err) {
-      console.error('[BESENDER 完成统计] 查询失败', err);
+      console.error('[BESENDER 售后统计] 查询失败', err);
       body.innerHTML = `<div class="error">查询失败：${escapeHtml(err.message || String(err))}</div>`;
     } finally {
       run.disabled = false;
     }
   }
 
+  function renderRepairCount(container, o) {
+    const stats = o.counts.rp;
+    const localStart = o.dr.localStart || o.dr.label || '';
+    const localEnd = o.dr.localEnd || o.dr.label || '';
+    const chinaStart = o.dr.start || o.dr.chinaStart || '';
+    const chinaEnd = o.dr.end || o.dr.chinaEnd || '';
+    const unclassified = Math.max(0, stats.done - stats.positive - stats.negative);
+    const metricRow = (label, count, rate = null, cls = '') => `
+      <tr${cls === 'total' ? ' class="total"' : ''}>
+        <td>${escapeHtml(label)}</td>
+        <td class="rate${cls === 'good' || cls === 'bad' ? ` ${cls}` : ''}">${count}</td>
+        <td class="rate${cls === 'good' || cls === 'bad' ? ` ${cls}` : ''}">${rate == null ? '—' : rate}</td>
+      </tr>`;
+
+    let crossHtml = '';
+    if (o.counts.doa != null) {
+      const doa = o.counts.doa;
+      const combined = {
+        done: doa.done + stats.done,
+        positive: doa.positive + stats.positive,
+        negative: doa.negative + stats.negative,
+      };
+      const comparisonRow = (label, s, cls = '') => `
+        <tr${cls ? ` class="${cls}"` : ''}>
+          <td>${escapeHtml(label)}</td>
+          <td class="good" style="text-align:right">${s.positive}（${fmtRate(s.positive, s.done)}）</td>
+          <td class="bad" style="text-align:right">${s.negative}（${fmtRate(s.negative, s.done)}）</td>
+          <td class="rate">${s.done}</td>
+        </tr>`;
+      crossHtml = `
+        <div class="hint" style="margin-top:10px">同时统计 DOA：以下仅比较按完成时间落入区间的完成结果。</div>
+        <table class="summary">
+          <thead><tr>
+            <th>类型</th><th style="text-align:right">良品（通过）</th>
+            <th style="text-align:right">不良品（不通过）</th><th style="text-align:right">完成数量</th>
+          </tr></thead>
+          <tbody>
+            ${comparisonRow('RP（维修）', stats)}
+            ${comparisonRow('DOA', doa)}
+            ${comparisonRow('合计 (DOA+RP)', combined, 'total')}
+          </tbody>
+        </table>`;
+    }
+
+    container.innerHTML = `
+      <div class="hint">
+        本地日期 <b>${escapeHtml(localStart)}</b> ~ <b>${escapeHtml(localEnd)}</b>
+        （${escapeHtml(o.dr.timezone)}）<br>
+        中国查询窗口 <b>${escapeHtml(chinaStart)}</b> ~ <b>${escapeHtml(chinaEnd)}</b><br>
+        公司：<b>${escapeHtml(o.companyLabel)}</b>（沿用页面筛选）｜
+        口径：<b>新订单/进行中按开始时间，已完成按完成时间</b>
+      </div>
+      <table class="summary">
+        <thead><tr><th>指标</th><th style="text-align:right">数量</th><th style="text-align:right">占已完成</th></tr></thead>
+        <tbody>
+          ${metricRow('新订单', stats.newOrders)}
+          ${metricRow('进行中', stats.inProgress)}
+          ${metricRow('已完成', stats.done, stats.done ? '100.0%' : '—', 'total')}
+          ${metricRow('良品', stats.positive, fmtRate(stats.positive, stats.done), 'good')}
+          ${metricRow('不良品', stats.negative, fmtRate(stats.negative, stats.done), 'bad')}
+          ${unclassified ? metricRow('未分类', unclassified, fmtRate(unclassified, stats.done)) : ''}
+        </tbody>
+      </table>
+      ${crossHtml}
+    `;
+  }
+
   function renderOrderCount(container, o) {
+    if (o.kind === 'rp' && o.counts.rp && o.counts.rp.newOrders != null) {
+      renderRepairCount(container, o);
+      return;
+    }
     const rows = [];
     if (o.counts.doa != null) rows.push(['DOA', o.counts.doa]);
     if (o.counts.rp  != null) rows.push(['RP（维修）', o.counts.rp]);
@@ -2050,8 +2287,14 @@
     if (isAggregablePage()) {
       const k = pageKind();
       ensureFab();
-      // 时间换算装饰只用于「中国时间」页面；DOA/RP 的时间已是本地时间，跳过。
-      if (k !== 'doa' && k !== 'rp') {
+      // DOA keeps its page-local display; RP and the remaining supported pages
+      // expose China timestamps and are decorated in their selected timezone.
+      if (k !== 'doa') {
+        const tz = k === 'rp' ? orderStatsTZ() : localTZ();
+        const tzScope = k === 'rp' ? 'order' : 'general';
+        // Vue keep-alive can leave an already-decorated page connected but hidden.
+        // Restore this page's own timezone before decorating any newly-rendered rows.
+        relabelDecoratedTimes(tz, tzScope);
         attachTimeTooltip();
         watchForTimestamps();
       }
