@@ -9,7 +9,7 @@ const vm = require('node:vm');
 const sourcePath = path.join(__dirname, '..', 'besender-aggregate.user.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 
-function loadHooks({ response = null } = {}) {
+function loadHooks({ response = null, rootVue = null, pathname = '/bsd-warehouse/engineerRepair' } = {}) {
   const apiStub = `  async function apiGet(path, params) {
     globalThis.__lastApiCall = { path, params };
     return globalThis.__apiResponse;
@@ -30,6 +30,8 @@ function loadHooks({ response = null } = {}) {
     localTodayStr,
     pageLocalTodayStr,
     countOrders,
+    readOrderPageQuery,
+    runOrderCount,
   };
   return;
 
@@ -66,11 +68,16 @@ ${bootMarker}`,
     Date: FixedDate,
     Intl: { DateTimeFormat: MockDateTimeFormat },
     __apiResponse: response,
+    document: {
+      querySelector: (selector) => selector === '#app' && rootVue ? { __vue__: rootVue } : null,
+    },
+    location: { pathname, hash: '', search: '' },
     localStorage: {
       getItem: () => 'Asia/Shanghai',
       removeItem() {},
       setItem() {},
     },
+    setTimeout(callback) { callback(); return 1; },
   };
   vm.createContext(context);
   vm.runInContext(instrumented, context, { filename: sourcePath });
@@ -179,6 +186,107 @@ test('order counts use meta.total and remove RP-only filters from DOA', async ()
   assert.equal('type_arr' in context.__lastApiCall.params, false);
   assert.equal('is_child' in context.__lastApiCall.params, false);
   assert.equal('service_type' in context.__lastApiCall.params, false);
+});
+
+test('RP order count inherits the company from the visible RP filter component', async () => {
+  const hiddenEl = { nodeType: 1, isConnected: true, getClientRects: () => [] };
+  const visibleEl = { nodeType: 1, isConnected: true, getClientRects: () => [{}] };
+  const rootVue = {
+    $children: [
+      {
+        query: { type: '15', status: '1', user_id: '' },
+        getData() { return '/engineer/afterSale/orderList'; },
+        $el: hiddenEl,
+      },
+      {
+        query: { type_arr: '1,2', is_child: 0, status: '1', user_id: '' },
+        getData() { return '/engineer/afterSale/orderList'; },
+        $el: hiddenEl,
+      },
+      {
+        query: { type_arr: '1,2', is_child: 0, status: '1', user_id: 7 },
+        // Production Vue/Babel wrappers often do not retain the endpoint name
+        // in Function#toString(); component matching must not depend on it.
+        getData() { return this._loadOrders(); },
+        $el: visibleEl,
+      },
+    ],
+  };
+  const context = loadHooks({
+    rootVue,
+    response: { code: 200, data: [], meta: { total: 3 } },
+  });
+
+  const query = context.__testHooks.readOrderPageQuery('rp');
+  const total = await context.__testHooks.countOrders(
+    'rp', query, '2', '2026-07-01 00:00:00', '2026-07-01 23:59:59',
+  );
+
+  assert.equal(total, 3);
+  assert.equal(query.user_id, 7);
+  assert.equal(query.type_arr, '1,2');
+  assert.equal('type' in query, false);
+  assert.equal(context.__lastApiCall.params.user_id, 7);
+});
+
+test('order query refuses to silently count all companies when user_id cannot be read', () => {
+  const rootVue = {
+    $children: [{
+      query: { type_arr: '1,2', is_child: 0, status: '1' },
+      getData() { return '/engineer/afterSale/orderList'; },
+      $el: { nodeType: 1, isConnected: true, getClientRects: () => [{}] },
+    }],
+  };
+  const context = loadHooks({ rootVue });
+
+  assert.equal(context.__testHooks.readOrderPageQuery('rp'), null);
+  assert.equal(context.__lastApiCall, undefined);
+});
+
+test('hidden cached order query cannot fall back to an all-company request', async () => {
+  const rootVue = {
+    $children: [{
+      query: { type_arr: '1,2', is_child: 0, status: '1', user_id: '' },
+      getData() { return '/engineer/afterSale/orderList'; },
+      $el: { nodeType: 1, isConnected: true, getClientRects: () => [] },
+    }],
+  };
+  const context = loadHooks({
+    rootVue,
+    response: { code: 200, data: [], meta: { total: 99 } },
+  });
+  const flashBar = { textContent: '', remove() {} };
+  const body = { querySelector: () => flashBar };
+  const panel = {
+    dataset: { dateMode: 'single' },
+    querySelector(selector) {
+      if (selector === '.body') return body;
+      if (selector === '.run') return { disabled: false };
+      if (selector === '.cross-cb') return { checked: false };
+      if (selector === '.date-input') return { value: '2026-07-01' };
+      return null;
+    },
+  };
+
+  await context.__testHooks.runOrderCount(panel, 'rp');
+
+  assert.match(flashBar.textContent, /未找到页面筛选条件/);
+  assert.equal(context.__lastApiCall, undefined);
+});
+
+test('ambiguous visible order components are rejected instead of using tree order', () => {
+  const visibleEl = { nodeType: 1, isConnected: true, getClientRects: () => [{}] };
+  const makeComponent = (userId) => ({
+    query: { type_arr: '1,2', is_child: 0, status: '1', user_id: userId },
+    getData() { return '/engineer/afterSale/orderList'; },
+    $el: visibleEl,
+  });
+  const context = loadHooks({
+    rootVue: { $children: [makeComponent(''), makeComponent(7)] },
+  });
+
+  assert.equal(context.__testHooks.readOrderPageQuery('rp'), null);
+  assert.equal(context.__lastApiCall, undefined);
 });
 
 test('order counts surface business errors instead of reporting zero', async () => {

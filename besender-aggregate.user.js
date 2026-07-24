@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.9.1
+// @version      1.9.2
 // @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；在 DOA / 维修(RP) 管理页按日期统计「完成」订单数量(公司沿用页面筛选)，可勾选同时统计另一类型得到 DOA+RP 合计。中国时间自动换算为本地时区，悬停显示原始中国时间。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
 // @author       YupengLai
 // @match        *://bms.besender.com/bsd-warehouse/*
@@ -441,6 +441,26 @@
       if (c.$children && c.$children.length) queue.push(...c.$children);
     }
     return null;
+  }
+
+  // Same traversal as findVueComponent(), but keeps every match. This is
+  // needed on keep-alive routes where both the DOA and RP page components can
+  // remain mounted at once even though only one of them is currently visible.
+  function findVueComponents(predicate) {
+    const root = document.querySelector('#app');
+    const start = root && root.__vue__;
+    if (!start) return [];
+    const queue = [start];
+    const seen  = new WeakSet();
+    const found = [];
+    while (queue.length) {
+      const c = queue.shift();
+      if (!c || seen.has(c)) continue;
+      seen.add(c);
+      try { if (predicate(c)) found.push(c); } catch (_) {}
+      if (c.$children && c.$children.length) queue.push(...c.$children);
+    }
+    return found;
   }
 
   function readPage1Query() {
@@ -1826,15 +1846,44 @@
 
   // 读取当前 engineerDoa / engineerRepair 列表组件的 query(含页面顶部 公司=user_id
   // 及关键字等用户已设的筛选)。返回浅拷贝；找不到则返回 null。
-  function readOrderPageQuery() {
-    const comp = findVueComponent(c => {
+  function orderQueryMatchesKind(query, kind) {
+    if (!query || !OC_TYPE[kind]) return false;
+    if (kind === 'doa') return String(query.type == null ? '' : query.type) === OC_TYPE.doa.type;
+    const rawTypes = Array.isArray(query.type_arr) ? query.type_arr : String(query.type_arr || '').split(',');
+    const types = rawTypes.map(v => String(v).trim()).filter(Boolean).sort().join(',');
+    return kind === 'rp' && types === '1,2'
+      && (query.is_child == null || String(query.is_child) === String(OC_TYPE.rp.is_child));
+  }
+
+  function isVisibleVueComponent(comp) {
+    const el = comp && comp.$el;
+    if (!el || el.nodeType !== 1 || el.isConnected === false) return false;
+    try {
+      return typeof el.getClientRects !== 'function' || el.getClientRects().length > 0;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function readOrderPageQuery(kind = pageKind()) {
+    const candidates = findVueComponents(c => {
       if (!c || !c.query || typeof c.query !== 'object') return false;
-      for (const m of ['getData', 'getList', 'getTableData']) {
-        if (typeof c[m] === 'function' && /orderList/.test(String(c[m]))) return true;
-      }
       const q = c.query;
-      return ('user_id' in q) && ('status' in q) && (('type' in q) || ('type_arr' in q));
+      // `user_id` must exist even when its current value is empty (全部公司).
+      // Accepting a different orderList component without this field would
+      // silently turn a selected company into an unfiltered statistics call.
+      if (!('user_id' in q) || !('status' in q) || !orderQueryMatchesKind(q, kind)) return false;
+      // Vue binds methods to the component instance and Babel may wrap async
+      // methods, so their Function#toString() need not retain "orderList".
+      return ['getData', 'getList', 'getTableData'].some(m => typeof c[m] === 'function');
     });
+    // Vue keep-alive may leave both page instances in the component tree. The
+    // active route's visible instance owns the company filter the user selected.
+    const visible = candidates.filter(isVisibleVueComponent);
+    // Fail closed: a hidden cached component or multiple visible candidates
+    // are ambiguous. Showing an error is safer than accidentally querying all
+    // companies from a stale query whose user_id is empty.
+    const comp = visible.length === 1 ? visible[0] : null;
     if (!comp) return null;
     const out = {};
     for (const k of Object.keys(comp.query)) {
@@ -1895,7 +1944,7 @@
     const dr = readOrderDateRange(panel);   // 日期直接用，不做时区换算
     if (!dr) { flash(body, '请选择有效日期'); return; }
 
-    const base = readOrderPageQuery();
+    const base = readOrderPageQuery(kind);
     if (!base) {
       flash(body, '未找到页面筛选条件，请等列表加载完成后重试');
       return;
