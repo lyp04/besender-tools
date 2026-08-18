@@ -1,0 +1,9 @@
+{
+  "name": "besender-tools",
+  "version": "1.11.0",
+  "private": true,
+  "scripts": {
+    "build": "node --check besender-aggregate.user.js",
+    "test": "node --test test/*.test.js"
+  }
+}

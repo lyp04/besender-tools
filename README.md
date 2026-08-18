@@ -1,24 +1,26 @@
 # besender-tools
 
-`bms.besender.com` 的 Tampermonkey 用户脚本：型号良品/不良品聚合统计、头程入库物料反查、售后维修订单统计，以及工程师订单 RP / DOA 完成统计。
+`bms.besender.com` 与 BESENDER Dashboard 的 Tampermonkey 用户脚本：型号良品/不良品聚合统计、头程入库物料反查、售后维修订单统计、工程师订单 RP / DOA 完成统计，以及 Dashboard 到 BMS 的一次性登录交接与 Token 复制。
 
 ## 安装
 
 1. 装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展（如果还没装）
 2. 点这个链接：
 
-   <https://raw.githubusercontent.com/lyp04/besender-tools/raw/main/besender-aggregate.user.js>
+   <https://raw.githubusercontent.com/lyp04/besender-tools/main/besender-aggregate.user.js>
 
    备用 raw URL（同一份内容）：
    <https://github.com/lyp04/besender-tools/raw/main/besender-aggregate.user.js>
 
 3. Tampermonkey 弹安装对话框 → 点「Install」
-4. 打开 `https://bms.besender.com/bsd-warehouse/...` 任一页面，右下角出现 📊 FAB 即成功
+4. 打开 `https://bms.besender.com/bsd-warehouse/...` 任一统计页面，右下角出现 📊 FAB 即成功；打开右上角头像菜单，可以在「常用工具」和「退出登录」之间看到「复制 Token」
 
 以后 Tampermonkey 会自动检查更新（默认每天）。要立即更新：Tampermonkey 控制台 → 该脚本 → 「Check for userscript updates」。
 
 ## 功能
 
+- **Dashboard 同会话打开 BMS**：Dashboard 在用户点击时打开 BMS 窗口；脚本在 BMS `document-start` 阶段生成 30 秒有效的一次性随机 nonce，严格校验 Dashboard origin 与 popup/opener WindowProxy 后才接收 token。角色只允许 `1/6 → adminToken`、`3/5/9/10 → warehouseToken`，其它角色拒绝；仅写入 BMS 当前会话的 `Bearer <access_token>` Cookie（`Path=/; Secure; SameSite=Lax`，不设置 `Max-Age` / `Expires`；浏览器的会话恢复策略仍可能恢复 session cookie），不会写入 URL、DOM、`localStorage`、`sessionStorage` 或日志
+- **复制 Token**：在 BMS 右上角头像下拉菜单的「常用工具」和「退出登录」之间注入「复制 Token」。仓库页只读取 `warehouseToken`，管理页只读取 `adminToken`，复制时剥掉一个 `Bearer ` 前缀，得到可直接粘贴回 Dashboard 的裸 `access_token`；只使用 Clipboard API，失败会显示可访问提示，不用隐藏输入框或 DOM 降级
 - **型号列表页** (`/single/refurbish`)：勾选多个型号 → 汇总良品 / 不良品 / 总和 / 报废率（单日或日期区间）；点良品数字旁的 ▶ 展开该型号（或合计）的 A类/B类/C类 等级明细（数量 + 占良品比例）；单个型号查询失败不影响其余型号的统计，悬停 ⚠ 查看失败原因
 - **详情页** (`/single/retreadDetail`)：单个型号的当日 / 区间统计，良品同样可展开 A/B/C 类明细
 - **头程入库列表页** (`/in_order/head_entry`)：按公司 + 预计到达时间窗（默认一周内）+ 机型（2080/2280/2351/2353，2352 计入 2353）或 SKU/产品名，反查在途/入库中订单命中的物料；命中的 SKU 可展开查看每张来源订单的预计到达时间，订单号点击直接跳转详情页
@@ -28,15 +30,30 @@
 - **时区**：型号列表/详情/头程入库及售后维修 (`/single/rp`) 的页面原始时间按中国时间处理，可切换为美东/美中/美西/德国/澳大利亚/中国或系统时区查看，鼠标悬停显示中国时间原文；售后维修统计默认美西 `America/Los_Angeles`，支持切换统计时区，并会把所选完整本地自然日（含夏令时 23/25 小时边界）换算为中国查询窗口；工程师订单 RP / DOA 保留原有页面本地时间口径
 - **面板保活**：站内切换 SPA 小标签页时，已打开的面板与查询结果保留在内存中，只有手动关闭面板（✕）或刷新页面才会清空
 
+## Dashboard 交接协议
+
+Dashboard 自己负责在按钮的同步点击处理器中调用 `window.open` 并保留返回的 popup 引用。CustomEvent 只用于探测脚本能力，绝不能携带 token：
+
+- 探测：`besender-dashboard:probe`，`detail = { protocol: 1, requestId }`
+- 就绪：`besender-tools:ready`，`detail = { protocol: 1, requestId, receiver, capabilities }`
+
+BMS popup 与 Dashboard 之间只使用带精确 `targetOrigin` 的 `postMessage`：
+
+1. BMS → Dashboard：`{ type: "besender-tools:bms-ready", protocol: 1, popupNonce, expiresInMs: 30000 }`
+2. Dashboard 严格确认 `event.origin === "https://bms.besender.com"` 且 `event.source === popup` 后，向该 popup 发送 `{ type: "besender-tools:token-transfer", protocol: 1, requestId, popupNonce, token, userType }`
+3. BMS → Dashboard：`{ type: "besender-tools:handoff-result", protocol: 1, requestId, popupNonce, ok, code, error, destination }`。`error` 仅在失败时等于非敏感错误码，任何结果都不回传 token
+
+Dashboard 必须在 `window.open` 之前注册 `message` 监听，并在结果或超时后清理本次 popup / request / nonce / timer 状态；若使用的是本次交接专属临时监听，也要同时移除监听。所有消息都必须同时校验 `origin`、popup `source`、`protocol`、`requestId` 与 `popupNonce`；禁止用 `*` 作为 `postMessage` 的目标 origin。
+
 ## 开发
 
 ```bash
 git clone https://github.com/lyp04/besender-tools.git
 cd besender-tools
 # 改 besender-aggregate.user.js，记得 bump @version
-node --check besender-aggregate.user.js
-node --test test/besender-aggregate.test.js
-git add besender-aggregate.user.js README.md test/
+npm run build
+npm test
+git add besender-aggregate.user.js README.md package.json test/
 git commit -m "..."
 git push
 ```
@@ -45,6 +62,7 @@ git push
 
 ## 历史
 
+- v1.11.0 — Dashboard 可用同一 token 一次性打开 BMS：短时 nonce + origin/source/角色白名单校验，按角色写 BMS 当前会话 Cookie；BMS 头像菜单新增可访问的「复制 Token」，复制裸 `access_token`，不把 token 放入 DOM、URL、日志或 userscript/服务端持久存储
 - v1.10.4 — 修正售后维修新订单、进行中偏大的问题：两项分别恢复当前状态 `status=1/2`，并继续按创建/开始时间限定范围；已完成及良品/不良品仍按完成事件统计，已出库订单不会漏掉
 - v1.10.3 — 调整售后维修多公司统计层级：公司数量分别缩进到新订单、进行中、已完成下面；每家公司的良品/不良品及比例再缩进到该公司的已完成数量下面
 - v1.10.2 — 售后维修改为事件统计：新订单按创建时间、进行中按开始时间、已完成按完成时间，均不受订单后续当前状态影响（例如已出库仍计入完成）；同时支持多选公司，多选时保留合计并缩进列出每家公司五项数量，单选时保持原有显示

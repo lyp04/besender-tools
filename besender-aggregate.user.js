@@ -1,12 +1,15 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.10.4
-// @description  在型号列表页勾选多个型号汇总良品/不良品/总和，良品数可点 ▶ 展开 A/B/C 类等级明细；在型号详情页一键查看当日/区间统计；在头程入库列表页按公司+预计到达时间窗+机型/SKU 反查在途/入库中订单的物料，可展开查看每单 ETA 并跳转详情；工程师订单的 DOA/RP 页保留完成统计，售后服务维修页按公司和本地日期统计当前新订单、当前进行中、完成事件及良品/不良品占比，多选公司时按指标缩进显示公司及品质明细。中国时间可切换为本地时区显示，悬停显示原文。切换站内小标签页时面板及查询结果保留在内存中，仅在手动关闭面板或刷新页面时清空。
+// @version      1.11.0
+// @description  BESENDER 业务统计、Dashboard 同 token 打开 BMS，以及 BMS 头像菜单安全复制 Token。
 // @author       YupengLai
-// @match        *://bms.besender.com/bsd-warehouse/*
-// @run-at       document-idle
+// @match        https://bms.besender.com/bsd-warehouse/*
+// @match        https://bms.besender.com/bsdAdmin/*
+// @match        https://dashboard.besender.lyp04.com/*
+// @run-at       document-start
 // @grant        none
+// @noframes
 // @updateURL    https://raw.githubusercontent.com/lyp04/besender-tools/main/besender-aggregate.user.js
 // @downloadURL  https://raw.githubusercontent.com/lyp04/besender-tools/main/besender-aggregate.user.js
 // ==/UserScript==
@@ -45,6 +48,547 @@
     orderList:         '/engineer/afterSale/orderList',  // DOA + 维修(RP) 共用
     afterSaleRepairList: '/warehouse/afterSale/orderList', // 售后服务 → 维修服务
   };
+
+  // ── Dashboard ↔ BMS one-time session bridge ─────────────────────────────
+  //
+  // Security boundary:
+  // - Dashboard CustomEvents are capability probes only and never carry a token.
+  // - The Dashboard page owns the popup WindowProxy and sends the token directly
+  //   with postMessage after checking both event.origin and event.source.
+  // - BMS accepts exactly one transfer from its opener, bound to a short-lived
+  //   cryptographic nonce. Tokens never enter URLs, DOM, logs, or userscript-owned
+  //   / persistent storage; the selected BMS session cookie is the only state.
+
+  const DASHBOARD_ORIGIN = 'https://dashboard.besender.lyp04.com';
+  const BMS_ORIGIN = 'https://bms.besender.com';
+  const BMS_WAREHOUSE_HOME_URL = BMS_ORIGIN + '/bsd-warehouse/home';
+  const BMS_ADMIN_HOME_URL = BMS_ORIGIN + '/bsdAdmin/home';
+  const BRIDGE_PROTOCOL = 1;
+  const BRIDGE_TTL_MS = 30_000;
+
+  const DASHBOARD_DISCOVER_EVENT = 'besender-dashboard:bms-bridge-discover';
+  const DASHBOARD_READY_EVENT = 'besender-dashboard:bms-bridge-ready';
+  const DASHBOARD_PROBE_EVENT = 'besender-dashboard:probe';
+  const DASHBOARD_PROBE_READY_EVENT = 'besender-tools:ready';
+  const BMS_READY_MESSAGE = 'besender-tools:bms-ready';
+  const BMS_TRANSFER_MESSAGE = 'besender-tools:token-transfer';
+  const BMS_RESULT_MESSAGE = 'besender-tools:handoff-result';
+
+  const COPY_TOKEN_ITEM_ATTR = 'data-besender-copy-token';
+  const COPY_TOKEN_STYLE_ID = 'besender-copy-token-style';
+  const COPY_TOKEN_FEEDBACK_ID = 'besender-copy-token-feedback';
+
+  const LOGOUT_LABELS = new Set([
+    '退出登录', '退出登陸', '退出',
+    'logout', 'log out', 'sign out',
+    'cerrar sesión', 'cerrar sesion',
+    'déconnexion', 'se déconnecter',
+    'abmelden', 'ログアウト', 'выйти',
+  ]);
+  const COMMON_TOOLS_LABELS = new Set([
+    '常用工具', 'common tools', 'tools',
+    'herramientas comunes', 'outils courants', 'werkzeuge',
+    'よく使うツール', 'инструменты',
+  ]);
+
+  let copyTokenFeedbackTimer = 0;
+
+  function currentOrigin() {
+    try {
+      if (location.origin && location.origin !== 'null') return location.origin;
+      if (location.protocol && location.host) return location.protocol + '//' + location.host;
+    } catch (_) {}
+    return '';
+  }
+
+  function validBridgeId(value) {
+    return typeof value === 'string'
+      && value.length >= 16
+      && value.length <= 128
+      && /^[A-Za-z0-9_-]+$/.test(value);
+  }
+
+  function randomBridgeId() {
+    try {
+      const secureCrypto = typeof crypto !== 'undefined' ? crypto : window.crypto;
+      if (secureCrypto && typeof secureCrypto.randomUUID === 'function') {
+        const id = secureCrypto.randomUUID();
+        return validBridgeId(id) ? id : '';
+      }
+      if (secureCrypto && typeof secureCrypto.getRandomValues === 'function') {
+        const bytes = new Uint8Array(24);
+        secureCrypto.getRandomValues(bytes);
+        return Array.from(bytes, byte => byte.toString(16).padStart(2, '0')).join('');
+      }
+    } catch (_) {}
+    return ''; // never downgrade a security nonce to Math.random()
+  }
+
+  function normalizeBmsBearerToken(value) {
+    let raw = typeof value === 'string' ? value.trim() : '';
+    raw = raw.replace(/^Bearer\s+/i, '').trim();
+    if (raw.length < 20 || raw.length > 8192 || /[\s\x00-\x1f\x7f]/.test(raw)) return '';
+    return 'Bearer ' + raw;
+  }
+
+  function rawAccessToken(value) {
+    const bearer = normalizeBmsBearerToken(value);
+    return bearer ? bearer.slice(7) : '';
+  }
+
+  function bmsAuthTarget(userType) {
+    const type = Number(userType);
+    if (type === 1 || type === 6) {
+      return { cookieName: 'adminToken', destination: 'admin', url: BMS_ADMIN_HOME_URL };
+    }
+    if (type === 3 || type === 5 || type === 9 || type === 10) {
+      return { cookieName: 'warehouseToken', destination: 'warehouse', url: BMS_WAREHOUSE_HOME_URL };
+    }
+    return null;
+  }
+
+  function cookieValue(name, cookieHeader) {
+    let source = cookieHeader;
+    if (typeof source !== 'string') {
+      try { source = document.cookie || ''; }
+      catch (_) { source = ''; }
+    }
+    const prefix = name + '=';
+    for (const part of String(source).split(';')) {
+      const item = part.trim();
+      if (!item.startsWith(prefix)) continue;
+      const encoded = item.slice(prefix.length);
+      try { return decodeURIComponent(encoded); }
+      catch (_) { return encoded; }
+    }
+    return '';
+  }
+
+  function writeBmsAuthCookie(token, userType) {
+    const target = bmsAuthTarget(userType);
+    if (!target) return { ok: false, code: 'unsupported_user_type' };
+
+    const bearer = normalizeBmsBearerToken(token);
+    if (!bearer) return { ok: false, code: 'invalid_token' };
+
+    try {
+      document.cookie = target.cookieName + '=' + encodeURIComponent(bearer)
+        + '; Path=/; Secure; SameSite=Lax';
+      if (cookieValue(target.cookieName) !== bearer) {
+        return { ok: false, code: 'cookie_write_failed' };
+      }
+    } catch (_) {
+      return { ok: false, code: 'cookie_write_failed' };
+    }
+
+    return {
+      ok: true,
+      code: 'ok',
+      cookieName: target.cookieName,
+      destination: target.destination,
+      url: target.url,
+    };
+  }
+
+  function bridgeResultMessage(requestId, popupNonce, result) {
+    const code = result && result.code ? result.code : 'unknown_error';
+    return {
+      type: BMS_RESULT_MESSAGE,
+      protocol: BRIDGE_PROTOCOL,
+      requestId,
+      popupNonce,
+      ok: Boolean(result && result.ok),
+      code,
+      error: result && result.ok ? null : code,
+      destination: result && result.destination ? result.destination : null,
+    };
+  }
+
+  function installDashboardBridgeProbe() {
+    if (window.top !== window || window.__besenderDashboardBridgeProbe) return;
+    window.__besenderDashboardBridgeProbe = true;
+
+    const onProbe = (event) => {
+      const detail = event && event.detail && typeof event.detail === 'object' ? event.detail : {};
+      if (detail.protocol != null && detail.protocol !== BRIDGE_PROTOCOL) return;
+      const requestId = validBridgeId(detail.requestId) ? detail.requestId : null;
+      const readyDetail = {
+        protocol: BRIDGE_PROTOCOL,
+        requestId,
+        receiver: 'besender-tools-userscript',
+        capabilities: ['popup-token-transfer-v1', 'copy-token'],
+      };
+      window.dispatchEvent(new CustomEvent(DASHBOARD_PROBE_READY_EVENT, { detail: readyDetail }));
+      // Keep the descriptive v1 event compatible with prerelease Dashboard builds.
+      window.dispatchEvent(new CustomEvent(DASHBOARD_READY_EVENT, { detail: readyDetail }));
+    };
+    window.addEventListener(DASHBOARD_PROBE_EVENT, onProbe);
+    window.addEventListener(DASHBOARD_DISCOVER_EVENT, onProbe);
+  }
+
+  function installBmsSessionReceiver() {
+    if (window.top !== window || window.__besenderBmsSessionReceiver) return null;
+    const dashboardWindow = window.opener;
+    if (!dashboardWindow || typeof dashboardWindow.postMessage !== 'function') return null;
+
+    const popupNonce = randomBridgeId();
+    if (!popupNonce) return null;
+
+    window.__besenderBmsSessionReceiver = true;
+    const issuedAt = Date.now();
+    let consumed = false;
+    let expiryTimer = 0;
+
+    const send = (message) => {
+      try {
+        dashboardWindow.postMessage(message, DASHBOARD_ORIGIN);
+        return true;
+      } catch (_) {
+        return false;
+      }
+    };
+
+    const finish = () => {
+      window.removeEventListener('message', onMessage);
+      if (expiryTimer) clearTimeout(expiryTimer);
+      expiryTimer = 0;
+    };
+
+    const onMessage = (event) => {
+      if (!event || event.origin !== DASHBOARD_ORIGIN || event.source !== dashboardWindow) return;
+      const data = event.data;
+      if (!data || typeof data !== 'object'
+          || data.type !== BMS_TRANSFER_MESSAGE
+          || data.protocol !== BRIDGE_PROTOCOL
+          || !validBridgeId(data.requestId)
+          || data.popupNonce !== popupNonce) return;
+
+      if (consumed) return;
+      consumed = true;
+      finish();
+
+      if (Date.now() - issuedAt > BRIDGE_TTL_MS) {
+        send(bridgeResultMessage(data.requestId, popupNonce, { ok: false, code: 'handshake_expired' }));
+        return;
+      }
+
+      let transferredToken = data.token;
+      const result = writeBmsAuthCookie(transferredToken, data.userType);
+      transferredToken = '';
+      send(bridgeResultMessage(data.requestId, popupNonce, result));
+
+      if (result.ok) {
+        try { window.opener = null; }
+        catch (_) {}
+        setTimeout(() => {
+          try { location.replace(result.url); }
+          catch (_) {}
+        }, 60);
+      }
+    };
+
+    window.addEventListener('message', onMessage);
+    expiryTimer = setTimeout(() => {
+      consumed = true;
+      finish();
+    }, BRIDGE_TTL_MS);
+    const readySent = send({
+      type: BMS_READY_MESSAGE,
+      protocol: BRIDGE_PROTOCOL,
+      popupNonce,
+      expiresInMs: BRIDGE_TTL_MS,
+    });
+    if (!readySent) finish();
+    return readySent ? { popupNonce, onMessage } : null;
+  }
+
+  // ── BMS avatar menu: Copy Token ──────────────────────────────────────────
+
+  function activeBmsRawAccessToken(cookieHeader) {
+    const path = String(location.pathname || '');
+    if (/^\/bsd-warehouse(?:\/|$)/.test(path)) {
+      return rawAccessToken(cookieValue('warehouseToken', cookieHeader));
+    }
+    if (/^\/bsdAdmin(?:\/|$)/.test(path)) {
+      return rawAccessToken(cookieValue('adminToken', cookieHeader));
+    }
+    return '';
+  }
+
+  async function copyActiveBmsToken(clipboard) {
+    const token = activeBmsRawAccessToken();
+    if (!token) return { ok: false, code: 'missing_token' };
+
+    const targetClipboard = clipboard
+      || (typeof navigator !== 'undefined' ? navigator.clipboard : null);
+    if (!targetClipboard || typeof targetClipboard.writeText !== 'function') {
+      return { ok: false, code: 'clipboard_unavailable' };
+    }
+    try {
+      await targetClipboard.writeText(token);
+      return { ok: true, code: 'copied' };
+    } catch (_) {
+      return { ok: false, code: 'clipboard_denied' };
+    }
+  }
+
+  function normalizedMenuText(value) {
+    return String(value || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+  }
+
+  function dropdownMenuItems(root) {
+    if (!root || typeof root.querySelectorAll !== 'function') return [];
+    try { return Array.from(root.querySelectorAll('ul.ivu-dropdown-menu li.ivu-dropdown-item')); }
+    catch (_) { return []; }
+  }
+
+  function hasIconClass(item, fragment) {
+    if (!item || typeof item.querySelector !== 'function') return false;
+    try { return Boolean(item.querySelector('[class*="' + fragment + '"]')); }
+    catch (_) { return false; }
+  }
+
+  function menuItemsByIconThenText(root, iconFragment, labels) {
+    const items = dropdownMenuItems(root);
+    const iconMatches = items.filter(item => hasIconClass(item, iconFragment));
+    if (iconMatches.length) return iconMatches;
+    return items.filter(item => labels.has(normalizedMenuText(item.textContent)));
+  }
+
+  function findLogoutMenuItems(root) {
+    return menuItemsByIconThenText(root, 'ios-log-out', LOGOUT_LABELS);
+  }
+
+  function findLogoutMenuItem(root) {
+    return findLogoutMenuItems(root)[0] || null;
+  }
+
+  function findCommonToolsMenuItem(root) {
+    return findCommonToolsMenuItems(root)[0] || null;
+  }
+
+  function findCommonToolsMenuItems(root) {
+    return menuItemsByIconThenText(root, 'md-reorder', COMMON_TOOLS_LABELS);
+  }
+
+  function copyTokenLanguage(logoutItem) {
+    const text = normalizedMenuText(logoutItem && logoutItem.textContent);
+    if (text.includes('退出')) return 'zh';
+    if (text.includes('cerrar sesi')) return 'es';
+    return 'en';
+  }
+
+  function copyTokenStrings(language) {
+    if (language === 'zh') {
+      return {
+        label: '复制 Token',
+        copied: 'Token 已复制到剪贴板',
+        missing_token: '未找到有效登录 Token，请重新登录 BMS',
+        clipboard_unavailable: '当前浏览器不支持剪贴板访问',
+        clipboard_denied: '复制失败，请允许剪贴板权限后重试',
+      };
+    }
+    if (language === 'es') {
+      return {
+        label: 'Copiar token',
+        copied: 'Token copiado al portapapeles',
+        missing_token: 'No se encontró una sesión válida; inicia sesión de nuevo',
+        clipboard_unavailable: 'El portapapeles no está disponible en este navegador',
+        clipboard_denied: 'No se pudo copiar; permite el acceso al portapapeles',
+      };
+    }
+    return {
+      label: 'Copy Token',
+      copied: 'Token copied to clipboard',
+      missing_token: 'No valid login token found; sign in to BMS again',
+      clipboard_unavailable: 'Clipboard access is unavailable in this browser',
+      clipboard_denied: 'Copy failed; allow clipboard access and try again',
+    };
+  }
+
+  function copyTokenFeedbackMessage(result, language) {
+    const strings = copyTokenStrings(language);
+    if (result && result.ok) return strings.copied;
+    return strings[result && result.code] || strings.clipboard_denied;
+  }
+
+  function ensureCopyTokenStyle() {
+    if (document.getElementById(COPY_TOKEN_STYLE_ID)) return;
+    const style = document.createElement('style');
+    style.id = COPY_TOKEN_STYLE_ID;
+    style.textContent = `
+      [${COPY_TOKEN_ITEM_ATTR}] {
+        display: flex !important;
+        align-items: center;
+        gap: 8px;
+        min-height: 44px;
+        cursor: pointer;
+      }
+      [${COPY_TOKEN_ITEM_ATTR}][aria-busy="true"] { cursor: wait; opacity: .68; }
+      [${COPY_TOKEN_ITEM_ATTR}]:focus-visible {
+        outline: 2px solid #2d8cf0;
+        outline-offset: -3px;
+        border-radius: 4px;
+      }
+      [${COPY_TOKEN_ITEM_ATTR}] .besender-copy-token-icon {
+        width: 16px;
+        height: 16px;
+        flex: 0 0 16px;
+        fill: currentColor;
+      }
+      #${COPY_TOKEN_FEEDBACK_ID} {
+        position: fixed;
+        z-index: 100000;
+        top: 72px;
+        right: 20px;
+        max-width: min(360px, calc(100vw - 40px));
+        padding: 10px 14px;
+        border-radius: 8px;
+        color: #fff;
+        background: #17233d;
+        box-shadow: 0 8px 24px rgba(0,0,0,.22);
+        font-size: 14px;
+        line-height: 1.5;
+        opacity: 0;
+        transform: translateY(-6px);
+        pointer-events: none;
+        transition: opacity .16s ease, transform .16s ease;
+      }
+      #${COPY_TOKEN_FEEDBACK_ID}.is-visible { opacity: 1; transform: translateY(0); }
+      #${COPY_TOKEN_FEEDBACK_ID}.is-error { background: #b42318; }
+      @media (prefers-reduced-motion: reduce) {
+        #${COPY_TOKEN_FEEDBACK_ID} { transition: none; }
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function ensureCopyTokenFeedback() {
+    let feedback = document.getElementById(COPY_TOKEN_FEEDBACK_ID);
+    if (feedback) return feedback;
+    if (!document.body) return null;
+    feedback = document.createElement('div');
+    feedback.id = COPY_TOKEN_FEEDBACK_ID;
+    feedback.setAttribute('role', 'status');
+    feedback.setAttribute('aria-live', 'polite');
+    feedback.setAttribute('aria-atomic', 'true');
+    document.body.appendChild(feedback);
+    return feedback;
+  }
+
+  function showCopyTokenFeedback(result, language) {
+    const feedback = ensureCopyTokenFeedback();
+    if (!feedback) return;
+    feedback.textContent = copyTokenFeedbackMessage(result, language);
+    feedback.classList.toggle('is-error', !(result && result.ok));
+    feedback.classList.add('is-visible');
+    if (copyTokenFeedbackTimer) clearTimeout(copyTokenFeedbackTimer);
+    copyTokenFeedbackTimer = setTimeout(() => {
+      feedback.classList.remove('is-visible');
+      setTimeout(() => { feedback.textContent = ''; }, 180);
+    }, 3200);
+  }
+
+  function createCopyTokenMenuItem(logoutItem) {
+    const language = copyTokenLanguage(logoutItem);
+    const strings = copyTokenStrings(language);
+    const item = document.createElement('li');
+    item.className = 'ivu-dropdown-item besender-copy-token-item';
+    item.setAttribute(COPY_TOKEN_ITEM_ATTR, 'true');
+    item.setAttribute('role', 'menuitem');
+    item.setAttribute('tabindex', '0');
+    item.setAttribute('aria-label', strings.label);
+
+    const icon = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    icon.setAttribute('class', 'besender-copy-token-icon');
+    icon.setAttribute('viewBox', '0 0 24 24');
+    icon.setAttribute('aria-hidden', 'true');
+    const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    path.setAttribute('d', 'M16 1H4a2 2 0 0 0-2 2v14h2V3h12V1zm3 4H8a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h11a2 2 0 0 0 2-2V7a2 2 0 0 0-2-2zm0 16H8V7h11v14z');
+    icon.appendChild(path);
+    const label = document.createElement('span');
+    label.textContent = strings.label;
+    item.appendChild(icon);
+    item.appendChild(label);
+
+    let busy = false;
+    const activate = async () => {
+      if (busy) return;
+      busy = true;
+      item.setAttribute('aria-busy', 'true');
+      const result = await copyActiveBmsToken();
+      showCopyTokenFeedback(result, language);
+      item.removeAttribute('aria-busy');
+      busy = false;
+    };
+    item.addEventListener('click', activate);
+    item.addEventListener('keydown', (event) => {
+      if (event.key !== 'Enter' && event.key !== ' ') return;
+      event.preventDefault();
+      activate();
+    });
+    return item;
+  }
+
+  function injectCopyTokenMenuItems(root) {
+    let inserted = 0;
+    const commonToolsItems = findCommonToolsMenuItems(root || document);
+    for (const logoutItem of findLogoutMenuItems(root || document)) {
+      const menu = logoutItem && logoutItem.parentElement;
+      if (!menu) continue;
+      const exists = Array.from(menu.children || []).some(child =>
+        child && typeof child.hasAttribute === 'function' && child.hasAttribute(COPY_TOKEN_ITEM_ATTR));
+      if (exists) continue;
+      const children = Array.from(menu.children || []);
+      const logoutIndex = children.indexOf(logoutItem);
+      const commonToolsItem = commonToolsItems.find(item => item.parentElement === menu);
+      const commonToolsIndex = children.indexOf(commonToolsItem);
+      const insertBefore = commonToolsIndex >= 0 && commonToolsIndex < logoutIndex
+        ? (children[commonToolsIndex + 1] || logoutItem)
+        : logoutItem;
+      menu.insertBefore(createCopyTokenMenuItem(logoutItem), insertBefore);
+      inserted += 1;
+    }
+    return inserted;
+  }
+
+  function installBmsCopyTokenMenu() {
+    if (window.top !== window || window.__besenderCopyTokenMenu) return;
+    window.__besenderCopyTokenMenu = true;
+
+    const start = () => {
+      if (!document.documentElement) return;
+      ensureCopyTokenStyle();
+      injectCopyTokenMenuItems(document);
+      if (typeof MutationObserver !== 'function') return;
+      let queued = false;
+      const observer = new MutationObserver(() => {
+        if (queued) return;
+        queued = true;
+        Promise.resolve().then(() => {
+          queued = false;
+          injectCopyTokenMenuItems(document);
+        });
+      });
+      observer.observe(document.documentElement, { childList: true, subtree: true });
+    };
+
+    if (document.documentElement) start();
+    else document.addEventListener('DOMContentLoaded', start, { once: true });
+  }
+
+  // Route before the legacy aggregation initializers so the Dashboard branch
+  // never reads localStorage, injects BMS CSS, patches history, or starts timers.
+  const bridgeOrigin = currentOrigin();
+  if (bridgeOrigin === DASHBOARD_ORIGIN) {
+    installDashboardBridgeProbe();
+    return;
+  }
+  if (bridgeOrigin === BMS_ORIGIN) {
+    installBmsSessionReceiver();
+    installBmsCopyTokenMenu();
+    if (!/^\/bsd-warehouse(?:\/|$)/.test(location.pathname || '')) return;
+  }
 
   // ── Page routing ────────────────────────────────────────────────────────
 
