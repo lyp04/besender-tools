@@ -43,6 +43,11 @@ function loadHooks({
     pageLocalTodayStr,
     afterSaleRepairStatsTZ,
     zonedDateRangeToChinaWindow,
+    parseServerTime,
+    serverTZ,
+    setAccountTimeZone,
+    ensureAccountTimeZone,
+    accountTimeZoneState,
     relabelDecoratedTimes,
     decorateTimestamps,
     textHasTimestamp,
@@ -1407,4 +1412,108 @@ test('after-sale repair stats require meta.total instead of trusting the first p
     ),
     /meta\.total/,
   );
+});
+
+test('account timezone defaults to Asia/Shanghai until the BMS profile is read', () => {
+  const context = loadHooks();
+  const hooks = context.__testHooks;
+
+  assert.equal(hooks.serverTZ(), 'Asia/Shanghai');
+  assert.equal(hooks.accountTimeZoneState().resolved, false);
+  assert.equal(hooks.parseServerTime('2026-08-26 00:15:43').toISOString(), '2026-08-25T16:15:43.000Z');
+});
+
+test('an America/Los_Angeles account reinterprets raw BMS timestamps and query windows', () => {
+  const context = loadHooks();
+  const hooks = context.__testHooks;
+
+  assert.equal(hooks.setAccountTimeZone('america/los_angeles'), 'America/Los_Angeles');
+  // Same instant the Shanghai account would render as "2026-08-26 00:15:43".
+  assert.equal(hooks.parseServerTime('2026-08-25 09:15:43').toISOString(), '2026-08-25T16:15:43.000Z');
+  assert.equal(hooks.parseServerTime('2026-01-15 09:00:00').toISOString(), '2026-01-15T17:00:00.000Z');
+
+  const la = hooks.zonedDateRangeToChinaWindow('2026-07-01', '2026-07-01', 'America/Los_Angeles');
+  assert.equal(la.chinaStart, '2026-07-01 00:00:00');
+  assert.equal(la.chinaEnd, '2026-07-01 23:59:59');
+  const berlin = hooks.zonedDateRangeToChinaWindow('2026-07-01', '2026-07-01', 'Europe/Berlin');
+  assert.equal(berlin.chinaStart, '2026-06-30 15:00:00');
+  assert.equal(berlin.chinaEnd, '2026-07-01 14:59:59');
+});
+
+test('ensureAccountTimeZone reads users/userInfo through the page axios once per TTL', async () => {
+  const calls = [];
+  const rootVue = {
+    $axios: {
+      async request(config) {
+        calls.push(config);
+        return { data: { data: { id: 11164, account: 'USCAEN054', timezone: 'Europe/Berlin' } } };
+      },
+    },
+  };
+  const context = loadHooks({ rootVue });
+  const hooks = context.__testHooks;
+
+  assert.equal(await hooks.ensureAccountTimeZone(), 'Europe/Berlin');
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, '/users/userInfo');
+  assert.equal(calls[0].method, 'get');
+  assert.equal(await hooks.ensureAccountTimeZone(), 'Europe/Berlin');
+  assert.equal(calls.length, 1, 'cached within the TTL');
+  const state = hooks.accountTimeZoneState();
+  assert.equal(state.resolved, true);
+  assert.equal(state.account, 'USCAEN054');
+  assert.equal(state.warning, '');
+  assert.equal(hooks.parseServerTime('2026-08-26 20:06:04').toISOString(), '2026-08-26T18:06:04.000Z');
+});
+
+test('concurrent account timezone reads share one profile request', async () => {
+  let requests = 0;
+  const rootVue = {
+    $axios: {
+      async request() {
+        requests += 1;
+        return { data: { data: { id: 1, timezone: 'Asia/Shanghai' } } };
+      },
+    },
+  };
+  const context = loadHooks({ rootVue });
+  const hooks = context.__testHooks;
+
+  const zones = await Promise.all([
+    hooks.ensureAccountTimeZone(),
+    hooks.ensureAccountTimeZone(),
+    hooks.ensureAccountTimeZone(),
+  ]);
+  assert.deepEqual(zones, ['Asia/Shanghai', 'Asia/Shanghai', 'Asia/Shanghai']);
+  assert.equal(requests, 1);
+});
+
+test('a profile without a usable timezone keeps the Asia/Shanghai fallback and records a warning', async () => {
+  const rootVue = {
+    $axios: { async request() { return { data: { data: { id: 1, timezone: 'Mars/Olympus' } } }; } },
+  };
+  const context = loadHooks({ rootVue });
+  const hooks = context.__testHooks;
+
+  assert.equal(await hooks.ensureAccountTimeZone(), 'Asia/Shanghai');
+  const state = hooks.accountTimeZoneState();
+  assert.equal(state.resolved, false);
+  assert.match(state.warning, /Mars\/Olympus/);
+});
+
+test('a failing profile request keeps the fallback, records the error, and does not throw', async () => {
+  const rootVue = { $axios: { async request() { throw new Error('HTTP 403'); } } };
+  const context = loadHooks({ rootVue });
+  const hooks = context.__testHooks;
+
+  assert.equal(await hooks.ensureAccountTimeZone(), 'Asia/Shanghai');
+  assert.match(hooks.accountTimeZoneState().warning, /HTTP 403/);
+});
+
+test('without a mounted BMS app the account timezone stays unresolved and no request is made', async () => {
+  const context = loadHooks();
+  const hooks = context.__testHooks;
+
+  assert.equal(await hooks.ensureAccountTimeZone(), 'Asia/Shanghai');
+  assert.equal(hooks.accountTimeZoneState().checkedAt, 0);
 });

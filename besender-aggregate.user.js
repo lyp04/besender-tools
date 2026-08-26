@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.11.0
+// @version      1.12.0
 // @description  BESENDER 业务统计、Dashboard 同 token 打开 BMS，以及 BMS 头像菜单安全复制 Token。
 // @author       YupengLai
 // @match        https://bms.besender.com/bsd-warehouse/*
@@ -28,7 +28,24 @@
   const TIME_CLS  = 'bsd-agg-time';   // marker class on rewritten time spans
   const TIME_RE   = /(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2})/g;
 
-  const SERVER_TZ = 'Asia/Shanghai';  // server stores timestamps in this timezone
+  // BMS renders every business timestamp — and interprets start/end query
+  // filters — in the *logged-in account's* profile timezone (`users/userInfo`
+  // → `data.timezone`, an IANA name), not in a fixed server zone. Verified
+  // 2026-08-26 with two accounts side by side on the same row: an
+  // America/Los_Angeles account sees "2026-08-25 09:15:43" where an
+  // Asia/Shanghai account sees "2026-08-26 00:15:43". The account timezone is
+  // therefore read first (see ensureAccountTimeZone) and Asia/Shanghai only
+  // remains the fallback until the profile has been read.
+  const FALLBACK_SERVER_TZ = 'Asia/Shanghai';
+  const ACCOUNT_TZ_TTL_MS   = 30 * 60 * 1000;  // re-read the profile this often
+  const ACCOUNT_TZ_RETRY_MS = 5 * 60 * 1000;   // retry sooner while unresolved
+  let accountTZ = '';            // normalized IANA zone from the profile ('' = not read yet / unusable)
+  let accountTZAccount = '';
+  let accountTZCheckedAt = 0;
+  let accountTZWarning = '';
+  let accountTZPending = null;
+  // Timezone every raw BMS wall-clock string is interpreted in.
+  function serverTZ() { return accountTZ || FALLBACK_SERVER_TZ; }
 
   // Page-2 row `status` field (workflow):
   //   1 待审核 / 2 可用 / 3 作废 / 4 待确认 / 5 已审核
@@ -41,6 +58,7 @@
 
   // Endpoint paths (under the same origin)
   const API = {
+    userInfo:          '/users/userInfo',
     manageList:        '/retreadOptimized/getRetreadManageList',
     retreadAll:        '/retreadOptimized/retreadDataListNoPage',
     inboundList:       '/warehouse/warehouse/inboundOrderList',
@@ -619,14 +637,103 @@
 
   // ── Time helpers ────────────────────────────────────────────────────────
 
-  // Parse a "YYYY-MM-DD HH:mm:ss" string interpreted in Asia/Shanghai → Date (UTC instant).
-  // The server uses China time without offset, so we compute the corresponding UTC instant manually.
+  // Parse a "YYYY-MM-DD HH:mm:ss" string interpreted in the account timezone
+  // (serverTZ()) → Date (UTC instant). Any IANA zone works, DST included; the
+  // offset is derived per value instead of assuming a fixed +8.
   function parseServerTime(str) {
     const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})$/.exec(String(str || '').trim());
     if (!m) return null;
     const [_, Y, Mo, D, h, mi, s] = m.map(Number);
-    // Asia/Shanghai is fixed UTC+8 (no DST). UTC instant = local time minus 8 hours.
-    return new Date(Date.UTC(Y, Mo - 1, D, h - 8, mi, s));
+    try {
+      return localWallToUTC(Y, Mo, D, h, mi, s, serverTZ());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // ── Account timezone (read first, before any BMS time is interpreted) ───
+
+  function normalizeTimeZone(value) {
+    const text = String(value == null ? '' : value).trim();
+    if (!/^[A-Za-z0-9_+\-/]{1,64}$/.test(text)) return '';
+    try {
+      return new Intl.DateTimeFormat('en-US', { timeZone: text }).resolvedOptions().timeZone || '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  // Already-decorated cells keep the raw BMS string in data-china, so a zone
+  // change can re-render them without another request.
+  function refreshAccountTimeZoneDisplay() {
+    try {
+      relabelDecoratedTimes(localTZ(), 'general');
+      relabelDecoratedTimes(afterSaleRepairStatsTZ(), 'afterSaleRepair');
+    } catch (_) {}
+  }
+
+  function setAccountTimeZone(tz, meta) {
+    const zone = normalizeTimeZone(tz);
+    const previous = serverTZ();
+    accountTZ = zone;
+    accountTZCheckedAt = Date.now();
+    accountTZWarning = zone ? '' : String((meta && meta.warning) || '');
+    if (meta && meta.account !== undefined) accountTZAccount = String(meta.account || '');
+    if (serverTZ() !== previous) refreshAccountTimeZoneDisplay();
+    return serverTZ();
+  }
+
+  function accountTimeZoneState() {
+    return {
+      timezone: serverTZ(),
+      resolved: !!accountTZ,
+      account: accountTZAccount,
+      warning: accountTZWarning,
+      checkedAt: accountTZCheckedAt,
+    };
+  }
+
+  // Read the profile timezone through the page's own axios (same session and
+  // auth headers as BMS itself). Concurrent callers share one request; failures
+  // keep the fallback zone, record a warning, and retry after ACCOUNT_TZ_RETRY_MS.
+  async function ensureAccountTimeZone(force) {
+    const ttl = accountTZ ? ACCOUNT_TZ_TTL_MS : ACCOUNT_TZ_RETRY_MS;
+    if (!force && accountTZCheckedAt && Date.now() - accountTZCheckedAt < ttl) return serverTZ();
+    if (accountTZPending) return accountTZPending;
+    accountTZPending = (async () => {
+      try {
+        const handle = findVueApi();
+        // Before the BMS app is mounted there is no session to ask; keep the
+        // fallback without starting the retry clock so the next caller asks again.
+        if (!handle || !handle.axios) return serverTZ();
+        const r = await handle.axios.request({
+          url: API.userInfo, method: 'get', params: { timestamp: Date.now() },
+        });
+        const body = r && r.data;
+        const profile = body && body.data && typeof body.data === 'object' && !Array.isArray(body.data)
+          ? body.data : null;
+        const raw = profile ? profile.timezone : undefined;
+        const zone = normalizeTimeZone(raw);
+        return setAccountTimeZone(zone, {
+          account: profile ? String(profile.account || profile.email || '') : '',
+          warning: zone ? '' : `账号资料未提供有效时区（${raw == null || raw === '' ? '空' : raw}），暂按 ${FALLBACK_SERVER_TZ} 解释 BMS 时间`,
+        });
+      } catch (err) {
+        return setAccountTimeZone('', {
+          warning: `读取账号时区失败，暂按 ${FALLBACK_SERVER_TZ} 解释 BMS 时间：${(err && err.message) || err}`,
+        });
+      } finally {
+        accountTZPending = null;
+      }
+    })();
+    return accountTZPending;
+  }
+
+  function accountTimeZoneHint() {
+    const state = accountTimeZoneState();
+    return state.warning
+      ? `<br><span class="warn">⚠ ${escapeHtml(state.warning)}</span>`
+      : '';
   }
 
   // Format a Date instant in a given IANA timezone as "YYYY-MM-DD HH:mm:ss".
@@ -735,9 +842,10 @@
   }
 
   // Interpret an inclusive calendar-date range in `tz`, then express the exact
-  // same instants as Asia/Shanghai wall-clock strings for the order API. The end
-  // is calculated from the next local midnight (not start + 24h), so 23/25-hour
-  // DST days are covered exactly once.
+  // same instants as wall-clock strings in the account timezone (serverTZ()) —
+  // BMS interprets start/end in that zone. The field names keep the historical
+  // "china" prefix. The end is calculated from the next local midnight (not
+  // start + 24h), so 23/25-hour DST days are covered exactly once.
   function zonedDateRangeToChinaWindow(startDate, endDate, tz) {
     const a = parseCalendarDate(startDate);
     const b = parseCalendarDate(endDate);
@@ -757,15 +865,15 @@
         timezone: tz,
         localStart: `${start} 00:00:00`,
         localEnd: `${end} 23:59:59`,
-        chinaStart: fmtInTZ(startUTC, SERVER_TZ),
-        chinaEnd: fmtInTZ(endUTC, SERVER_TZ),
+        chinaStart: fmtInTZ(startUTC, serverTZ()),
+        chinaEnd: fmtInTZ(endUTC, serverTZ()),
       };
     } catch (_) {
       return null;
     }
   }
 
-  // For a local-calendar date return the matching Asia/Shanghai API window.
+  // For a local-calendar date return the matching account-timezone API window.
   function localDateToChinaRange(localDateStr, tz = localTZ()) {
     const r = zonedDateRangeToChinaWindow(localDateStr, localDateStr, tz);
     return r ? [r.chinaStart, r.chinaEnd] : null;
@@ -1400,6 +1508,8 @@
     });
 
     run.addEventListener('click', async () => {
+      // Account timezone first: the query window below is expressed in it.
+      await ensureAccountTimeZone();
       const chosen = Array.from(list.querySelectorAll('input[type=checkbox]:checked'))
         .map(b => models[Number(b.dataset.i)]);
       if (!chosen.length) {
@@ -1585,8 +1695,8 @@
     if (!visibleRows.length) {
       container.innerHTML = `
         <div class="hint">
-          本地 <b>${escapeHtml(label)}</b> (${escapeHtml(tz)}) 对应中国时间窗口：
-          <b>${escapeHtml(chinaStart)}</b> ~ <b>${escapeHtml(chinaEnd)}</b>
+          本地 <b>${escapeHtml(label)}</b> (${escapeHtml(tz)}) 对应 BMS 查询窗口（${escapeHtml(serverTZ())}）：
+          <b>${escapeHtml(chinaStart)}</b> ~ <b>${escapeHtml(chinaEnd)}</b>${accountTimeZoneHint()}
         </div>
         <div class="empty">所选 ${rows.length} 个型号在该时段均无产出</div>
       `;
@@ -1595,8 +1705,8 @@
 
     container.innerHTML = `
       <div class="hint">
-        本地 <b>${escapeHtml(label)}</b> (${escapeHtml(tz)}) 对应中国时间窗口：
-        <b>${escapeHtml(chinaStart)}</b> ~ <b>${escapeHtml(chinaEnd)}</b><br>
+        本地 <b>${escapeHtml(label)}</b> (${escapeHtml(tz)}) 对应 BMS 查询窗口（${escapeHtml(serverTZ())}）：
+        <b>${escapeHtml(chinaStart)}</b> ~ <b>${escapeHtml(chinaEnd)}</b>${accountTimeZoneHint()}<br>
         点「良品」数字旁的 ▶ 展开 A/B/C 类明细。
       </div>
       <table class="summary">
@@ -1661,6 +1771,7 @@
     const model = { sku, model: modelCode, productName, manage_id, warehouse_id, auditable: '' };
 
     async function refresh() {
+      await ensureAccountTimeZone();
       const range = readPanelDateRange(panel);
       if (!range) { body.innerHTML = '<div class="error">日期格式错误</div>'; return; }
       body.innerHTML = `<div class="loading">查询 ${escapeHtml(sku || manage_id)} (${escapeHtml(range.label)}) …</div>`;
@@ -1790,6 +1901,7 @@
     result.innerHTML = '<div class="empty">请选择公司并输入机型或 SKU 后点击「搜索」</div>';
 
     async function run() {
+      await ensureAccountTimeZone();
       const model = modelInput.value.trim();
       const sku   = skuInput.value.trim();
       if (!model && !sku) { flash(body, '请输入机型或 SKU'); return; }
@@ -2318,7 +2430,7 @@
       const china = el.dataset.china || '';
       const tz    = el.dataset.localTz || localTZ();
       tip.innerHTML = `
-        <div class="row"><span class="label">中国时间</span><span>${escapeHtml(china)}</span></div>
+        <div class="row"><span class="label">BMS 原文 (${escapeHtml(serverTZ())})</span><span>${escapeHtml(china)}</span></div>
         <div class="row"><span class="label">本地 (${escapeHtml(tz)})</span><span>${escapeHtml(el.textContent)}</span></div>
       `;
       tip.style.display = 'block';
@@ -2668,7 +2780,7 @@
   //   良品/不良品使用 is_perfect=1/0。
   // 新订单和进行中是当前状态桶；完成及品质是历史完成事件，不叠加当前 status，
   // 否则完成后已出库的订单会从完成统计中消失。
-  // 页面展示的是中国墙钟时间，统计日期始终按用户明确选择的时区解释，默认美西。
+  // 页面展示的是账号时区（serverTZ()）的墙钟时间，统计日期始终按用户明确选择的时区解释，默认美西。
 
   const ASR_STATUS_NEW = '1';
   const ASR_STATUS_PROGRESS = '2';
@@ -2960,6 +3072,8 @@
   async function runAfterSaleRepairCount(panel) {
     const body = panel.querySelector('.body');
     const run = panel.querySelector('.run');
+    // Account timezone first: the completion/creation windows are sent in it.
+    await ensureAccountTimeZone();
     const dr = readAfterSaleRepairDateRange(panel);
     if (!dr) { flash(body, '请选择有效日期和统计时区'); return; }
 
@@ -3049,7 +3163,7 @@
       <div class="hint">
         本地日期 <b>${escapeHtml(o.dr.localStart)}</b> ~ <b>${escapeHtml(o.dr.localEnd)}</b>
         （${escapeHtml(o.dr.timezone)}）<br>
-        中国查询窗口 <b>${escapeHtml(o.dr.chinaStart)}</b> ~ <b>${escapeHtml(o.dr.chinaEnd)}</b><br>
+        BMS 查询窗口（${escapeHtml(serverTZ())}） <b>${escapeHtml(o.dr.chinaStart)}</b> ~ <b>${escapeHtml(o.dr.chinaEnd)}</b>${accountTimeZoneHint()}<br>
         公司：<b>${escapeHtml(o.companyLabel)}</b>（沿用售后维修页面筛选）<br>
         口径：<b>当前新订单按创建时间；当前进行中按开始时间；已完成按完成时间</b><br>
         新订单与进行中限定当前状态；已完成按完成事件统计（已出库仍计入完成）。
@@ -3071,11 +3185,16 @@
 
   function boot() {
     injectStyle();
+    // Account timezone first: kick off the profile read as early as possible so
+    // decorated timestamps and query windows use the right zone; cells decorated
+    // before it resolves are relabeled when it does.
+    ensureAccountTimeZone().catch(() => {});
     if (isAggregablePage()) {
       const k = pageKind();
       ensureFab();
       // Engineer DOA/RP retain their original local display. The separate
-      // after-sales repair page and the other supported pages expose China time.
+      // after-sales repair page and the other supported pages expose the raw
+      // account-timezone wall clock.
       if (k !== 'doa' && k !== 'rp') {
         const tz = k === 'afterSaleRepair' ? afterSaleRepairStatsTZ() : localTZ();
         const tzScope = k === 'afterSaleRepair' ? 'afterSaleRepair' : 'general';
