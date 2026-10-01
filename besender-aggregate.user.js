@@ -6,6 +6,7 @@
 // @author       YupengLai
 // @match        https://bms.besender.com/bsd-warehouse/*
 // @match        https://bms.besender.com/bsdAdmin/*
+// @match        https://besender.lyp04.com/*
 // @match        https://view.besender.lyp04.com/*
 // @run-at       document-start
 // @grant        none
@@ -77,7 +78,11 @@
   //   cryptographic nonce. Tokens never enter URLs, DOM, logs, or userscript-owned
   //   / persistent storage; the selected BMS session cookie is the only state.
 
-  const DASHBOARD_ORIGIN = 'https://view.besender.lyp04.com';
+  // Exact-match allowlist of Dashboard origins (no prefix/suffix matching, no
+  // other subdomains). The popup cannot read its opener's origin, so bms-ready is
+  // posted once to each of these with an explicit targetOrigin (a non-matching
+  // origin is silently dropped by the browser); never '*'.
+  const DASHBOARD_ORIGINS = ['https://besender.lyp04.com', 'https://view.besender.lyp04.com'];
   const BMS_ORIGIN = 'https://bms.besender.com';
   const BMS_WAREHOUSE_HOME_URL = BMS_ORIGIN + '/bsd-warehouse/home';
   const BMS_ADMIN_HOME_URL = BMS_ORIGIN + '/bsdAdmin/home';
@@ -257,9 +262,10 @@
     let consumed = false;
     let expiryTimer = 0;
 
-    const send = (message) => {
+    const send = (message, targetOrigin) => {
       try {
-        dashboardWindow.postMessage(message, DASHBOARD_ORIGIN);
+        if (!DASHBOARD_ORIGINS.includes(targetOrigin)) return false;
+        dashboardWindow.postMessage(message, targetOrigin);
         return true;
       } catch (_) {
         return false;
@@ -273,7 +279,8 @@
     };
 
     const onMessage = (event) => {
-      if (!event || event.origin !== DASHBOARD_ORIGIN || event.source !== dashboardWindow) return;
+      if (!event || !DASHBOARD_ORIGINS.includes(event.origin) || event.source !== dashboardWindow) return;
+      const replyOrigin = event.origin;
       const data = event.data;
       if (!data || typeof data !== 'object'
           || data.type !== BMS_TRANSFER_MESSAGE
@@ -286,14 +293,14 @@
       finish();
 
       if (Date.now() - issuedAt > BRIDGE_TTL_MS) {
-        send(bridgeResultMessage(data.requestId, popupNonce, { ok: false, code: 'handshake_expired' }));
+        send(bridgeResultMessage(data.requestId, popupNonce, { ok: false, code: 'handshake_expired' }), replyOrigin);
         return;
       }
 
       let transferredToken = data.token;
       const result = writeBmsAuthCookie(transferredToken, data.userType);
       transferredToken = '';
-      send(bridgeResultMessage(data.requestId, popupNonce, result));
+      send(bridgeResultMessage(data.requestId, popupNonce, result), replyOrigin);
 
       if (result.ok) {
         try { window.opener = null; }
@@ -310,12 +317,16 @@
       consumed = true;
       finish();
     }, BRIDGE_TTL_MS);
-    const readySent = send({
+    const readyMessage = {
       type: BMS_READY_MESSAGE,
       protocol: BRIDGE_PROTOCOL,
       popupNonce,
       expiresInMs: BRIDGE_TTL_MS,
-    });
+    };
+    let readySent = false;
+    for (const origin of DASHBOARD_ORIGINS) {
+      if (send(readyMessage, origin)) readySent = true;
+    }
     if (!readySent) finish();
     return readySent ? { popupNonce, onMessage } : null;
   }
@@ -598,7 +609,7 @@
   // Route before the legacy aggregation initializers so the Dashboard branch
   // never reads localStorage, injects BMS CSS, patches history, or starts timers.
   const bridgeOrigin = currentOrigin();
-  if (bridgeOrigin === DASHBOARD_ORIGIN) {
+  if (DASHBOARD_ORIGINS.includes(bridgeOrigin)) {
     installDashboardBridgeProbe();
     return;
   }
