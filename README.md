@@ -37,20 +37,15 @@ Dashboard 自己负责在按钮的同步点击处理器中调用 `window.open` �
 - 探测：`besender-dashboard:probe`，`detail = { protocol: 1, requestId }`
 - 就绪：`besender-tools:ready`，`detail = { protocol: 1, requestId, receiver, capabilities }`
 
-**受信 Dashboard 来源**（精确匹配，不做前后缀或通配匹配，其它子域一律不认）：
-
-- `https://besender.lyp04.com`
-- `https://view.besender.lyp04.com`（新的数据面板）
-
-旧看板 `dashboard.besender.lyp04.com` 已下线，v1.13.0 起不再受信。脚本只在这两个来源上装探测器（`@match` 同样只有这两个），其它页面不会加载交接逻辑。
+脚本只认两个 Dashboard 来源，按完整 origin 精确比较：`https://besender.lyp04.com` 和 `https://view.besender.lyp04.com`（数据面板）。旧看板 `dashboard.besender.lyp04.com` 已下线，不再认。
 
 BMS popup 与 Dashboard 之间只使用带精确 `targetOrigin` 的 `postMessage`：
 
-1. BMS → Dashboard：`{ type: "besender-tools:bms-ready", protocol: 1, popupNonce, expiresInMs: 30000 }`。popup 读不到 opener 的 origin，所以对上面两个受信来源**各发一次**，`targetOrigin` 都是确定字符串；来源不匹配的一次会被浏览器静默丢弃，不会泄露
+1. BMS → Dashboard：`{ type: "besender-tools:bms-ready", protocol: 1, popupNonce, expiresInMs: 30000 }`。popup 读不到 opener 的 origin，所以对两个来源各发一次，`targetOrigin` 都写死，对不上的那次浏览器直接丢掉
 2. Dashboard 严格确认 `event.origin === "https://bms.besender.com"` 且 `event.source === popup` 后，向该 popup 发送 `{ type: "besender-tools:token-transfer", protocol: 1, requestId, popupNonce, token, userType }`
-3. BMS → Dashboard：`{ type: "besender-tools:handoff-result", protocol: 1, requestId, popupNonce, ok, code, error, destination }`，只回给发来 token-transfer 的那个 `event.origin`。`error` 仅在失败时等于非敏感错误码，任何结果都不回传 token
+3. BMS → Dashboard：`{ type: "besender-tools:handoff-result", protocol: 1, requestId, popupNonce, ok, code, error, destination }`，只回给发来 token-transfer 的那个 origin。`error` 仅在失败时等于非敏感错误码，任何结果都不回传 token
 
-BMS 侧只接受 `event.origin` 精确等于上述两个来源之一、且 `event.source` 等于 `window.opener` 的消息。Dashboard 必须在 `window.open` 之前注册 `message` 监听，并在结果或超时后清理本次 popup / request / nonce / timer 状态；若使用的是本次交接专属临时监听，也要同时移除监听。所有消息都必须同时校验 `origin`、popup `source`、`protocol`、`requestId` 与 `popupNonce`；禁止用 `*` 作为 `postMessage` 的目标 origin。
+BMS 侧只接受 `event.origin` 是上面两个来源之一、且 `event.source` 等于 `window.opener` 的消息。Dashboard 必须在 `window.open` 之前注册 `message` 监听，并在结果或超时后清理本次 popup / request / nonce / timer 状态；若使用的是本次交接专属临时监听，也要同时移除监听。所有消息都必须同时校验 `origin`、popup `source`、`protocol`、`requestId` 与 `popupNonce`；禁止用 `*` 作为 `postMessage` 的目标 origin。
 
 ## 开发
 
@@ -69,7 +64,7 @@ git push
 
 ## 历史
 
-- v1.13.0 — 会话交接改认新的数据面板：受信来源由已下线的 `https://dashboard.besender.lyp04.com` 换成两个精确来源 `https://besender.lyp04.com` 与 `https://view.besender.lyp04.com`（`DASHBOARD_ORIGINS` 数组、精确相等，`@match` 同步）。BMS popup 对两个来源各发一次 `bms-ready`，收消息要求 `event.origin` 在白名单内且 `event.source === window.opener`，`handoff-result` 只回给发来 token 的 origin；协议 `BRIDGE_PROTOCOL` 仍为 1，消息类型、nonce、30 秒过期、origin+source 双重校验均不变。补了 look-alike / http / 带端口 / 其它子域等反例测试
+- v1.13.0 — 会话交接改认数据面板：来源从下线的旧看板换成 `besender.lyp04.com` 和 `view.besender.lyp04.com`，`bms-ready` 对两个来源各发一次，协议不变
 - v1.12.0 — 先读账号时区：BMS 的原始时间与 `start/end` 查询窗口都按登录账号资料的 `timezone` 解释（任意 IANA 时区、夏令时按真实偏移），不再固定按中国时间；页面时间装饰、悬停提示、翻新聚合、头程入库 ETA、售后维修统计全部随账号时区换算，读不到时回退 `Asia/Shanghai` 并在面板提示。起因：换用 `Asia/Shanghai` 账号后 BMS 把洛杉矶白天的行整体 +15 h，"今天"变成昨天的复制版
 - v1.11.0 — Dashboard 可用同一 token 一次性打开 BMS：短时 nonce + origin/source/角色白名单校验，按角色写 BMS 当前会话 Cookie；BMS 头像菜单新增可访问的「复制 Token」，复制裸 `access_token`，不把 token 放入 DOM、URL、日志或 userscript/服务端持久存储
 - v1.10.4 — 修正售后维修新订单、进行中偏大的问题：两项分别恢复当前状态 `status=1/2`，并继续按创建/开始时间限定范围；已完成及良品/不良品仍按完成事件统计，已出库订单不会漏掉
