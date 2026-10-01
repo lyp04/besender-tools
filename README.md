@@ -4,10 +4,8 @@
 
 ## 安装
 
-本仓库是**私有仓**：下面的 raw 安装链接必须先在同一浏览器里登录有权限的 GitHub 账号才能打开，未登录会得到 404。
-
 1. 装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展（如果还没装）
-2. 先登录 GitHub，再点这个链接：
+2. 点这个链接：
 
    <https://raw.githubusercontent.com/lyp04/besender-tools/main/besender-aggregate.user.js>
 
@@ -17,7 +15,7 @@
 3. Tampermonkey 弹安装对话框 → 点「Install」
 4. 打开 `https://bms.besender.com/bsd-warehouse/...` 任一统计页面，右下角出现 📊 FAB 即成功；打开右上角头像菜单，可以在「常用工具」和「退出登录」之间看到「复制 Token」
 
-以后 Tampermonkey 会自动检查更新（默认每天）。要立即更新：Tampermonkey 控制台 → 该脚本 → 「Check for userscript updates」。自动更新同样走 raw 链接，所以也要保持浏览器里的 GitHub 登录有效。
+以后 Tampermonkey 会自动检查更新（默认每天）。要立即更新：Tampermonkey 控制台 → 该脚本 → 「Check for userscript updates」。
 
 ## 功能
 
@@ -71,7 +69,7 @@ git push
 
 ## 历史
 
-- v1.13.0 — 会话交接改认新的数据面板：受信来源由已下线的 `https://dashboard.besender.lyp04.com` 换成两个精确来源 `https://besender.lyp04.com` 与 `https://view.besender.lyp04.com`（`DASHBOARD_ORIGINS` 数组、精确相等，`@match` 同步）。BMS popup 对两个来源各发一次 `bms-ready`，收消息要求 `event.origin` 在白名单内且 `event.source === window.opener`，`handoff-result` 只回给发来 token 的 origin；协议 `BRIDGE_PROTOCOL` 仍为 1，消息类型、nonce、30 秒过期、origin+source 双重校验均不变。补了look-alike / http / 带端口 / 其它子域等反例测试
+- v1.13.0 — 会话交接改认新的数据面板：受信来源由已下线的 `https://dashboard.besender.lyp04.com` 换成两个精确来源 `https://besender.lyp04.com` 与 `https://view.besender.lyp04.com`（`DASHBOARD_ORIGINS` 数组、精确相等，`@match` 同步）。BMS popup 对两个来源各发一次 `bms-ready`，收消息要求 `event.origin` 在白名单内且 `event.source === window.opener`，`handoff-result` 只回给发来 token 的 origin；协议 `BRIDGE_PROTOCOL` 仍为 1，消息类型、nonce、30 秒过期、origin+source 双重校验均不变。补了 look-alike / http / 带端口 / 其它子域等反例测试
 - v1.12.0 — 先读账号时区：BMS 的原始时间与 `start/end` 查询窗口都按登录账号资料的 `timezone` 解释（任意 IANA 时区、夏令时按真实偏移），不再固定按中国时间；页面时间装饰、悬停提示、翻新聚合、头程入库 ETA、售后维修统计全部随账号时区换算，读不到时回退 `Asia/Shanghai` 并在面板提示。起因：换用 `Asia/Shanghai` 账号后 BMS 把洛杉矶白天的行整体 +15 h，"今天"变成昨天的复制版
 - v1.11.0 — Dashboard 可用同一 token 一次性打开 BMS：短时 nonce + origin/source/角色白名单校验，按角色写 BMS 当前会话 Cookie；BMS 头像菜单新增可访问的「复制 Token」，复制裸 `access_token`，不把 token 放入 DOM、URL、日志或 userscript/服务端持久存储
 - v1.10.4 — 修正售后维修新订单、进行中偏大的问题：两项分别恢复当前状态 `status=1/2`，并继续按创建/开始时间限定范围；已完成及良品/不良品仍按完成事件统计，已出库订单不会漏掉
