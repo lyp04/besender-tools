@@ -1,12 +1,12 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.12.0
+// @version      1.13.0
 // @description  BESENDER 业务统计、Dashboard 同 token 打开 BMS，以及 BMS 头像菜单安全复制 Token。
 // @author       YupengLai
 // @match        https://bms.besender.com/bsd-warehouse/*
 // @match        https://bms.besender.com/bsdAdmin/*
-// @match        https://dashboard.besender.lyp04.com/*
+// @match        https://view.besender.lyp04.com/*
 // @run-at       document-start
 // @grant        none
 // @noframes
@@ -77,7 +77,7 @@
   //   cryptographic nonce. Tokens never enter URLs, DOM, logs, or userscript-owned
   //   / persistent storage; the selected BMS session cookie is the only state.
 
-  const DASHBOARD_ORIGIN = 'https://dashboard.besender.lyp04.com';
+  const DASHBOARD_ORIGIN = 'https://view.besender.lyp04.com';
   const BMS_ORIGIN = 'https://bms.besender.com';
   const BMS_WAREHOUSE_HOME_URL = BMS_ORIGIN + '/bsd-warehouse/home';
   const BMS_ADMIN_HOME_URL = BMS_ORIGIN + '/bsdAdmin/home';
