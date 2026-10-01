@@ -9,6 +9,9 @@ const vm = require('node:vm');
 const sourcePath = path.join(__dirname, '..', 'besender-aggregate.user.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 
+const ROOT_ORIGIN = 'https://besender.lyp04.com';
+const VIEW_ORIGIN = 'https://view.besender.lyp04.com';
+
 class FakeClassList {
   constructor() { this.values = new Set(); }
   add(...values) { values.forEach(value => this.values.add(value)); }
@@ -143,7 +146,7 @@ function instrumentBridgeHooks() {
   const instrumented = source.replace(
     bootMarker,
     `  globalThis.__bridgeHooks = {
-    DASHBOARD_ORIGIN,
+    DASHBOARD_ORIGINS,
     BMS_ORIGIN,
     BMS_READY_MESSAGE,
     BMS_TRANSFER_MESSAGE,
@@ -179,13 +182,14 @@ ${bootMarker}`,
   return instrumented;
 }
 
-function loadBridgeHarness({ pathname = '/test-harness', now = 1_000 } = {}) {
+function loadBridgeHarness({ pathname = '/test-harness', now = 1_000, origin = '' } = {}) {
   const document = new FakeDocument();
   const window = new FakeWindow();
   const location = {
     pathname,
     search: '',
     hash: '',
+    origin,
     replacedWith: null,
     replace(url) { this.replacedWith = url; },
   };
@@ -255,9 +259,17 @@ function menuItem(text, iconFragment = '') {
 test('userscript metadata is narrowly scoped and runs before BMS application code', () => {
   assert.match(source, /@match\s+https:\/\/bms\.besender\.com\/bsd-warehouse\/\*/);
   assert.match(source, /@match\s+https:\/\/bms\.besender\.com\/bsdAdmin\/\*/);
-  assert.match(source, /@match\s+https:\/\/dashboard\.besender\.lyp04\.com\/\*/);
+  assert.match(source, /@match\s+https:\/\/besender\.lyp04\.com\/\*/);
+  assert.match(source, /@match\s+https:\/\/view\.besender\.lyp04\.com\/\*/);
+  assert.doesNotMatch(source, /dashboard\.besender\.lyp04\.com/);
+  assert.doesNotMatch(source, /@match\s+https:\/\/\*\./);
   assert.match(source, /@run-at\s+document-start/);
   assert.match(source, /@noframes/);
+});
+
+test('Dashboard origin allowlist is exactly the two known origins', () => {
+  const { hooks } = loadBridgeHarness();
+  assert.deepEqual(Array.from(hooks.DASHBOARD_ORIGINS), [ROOT_ORIGIN, VIEW_ORIGIN]);
 });
 
 test('token normalization produces exactly one Bearer prefix and rejects malformed values', () => {
@@ -312,14 +324,17 @@ test('BMS receiver accepts one nonce-bound transfer only from the exact Dashboar
   assert.ok(receiver);
   assert.equal(receiver.popupNonce, 'popup_nonce_1234567890abcdef');
   assert.equal(window.listenerCount('message'), 1);
-  assert.equal(sent.length, 1);
-  assert.deepEqual({ ...sent[0].message }, {
-    type: 'besender-tools:bms-ready',
-    protocol: 1,
-    popupNonce: 'popup_nonce_1234567890abcdef',
-    expiresInMs: 30000,
-  });
-  assert.equal(sent[0].targetOrigin, 'https://dashboard.besender.lyp04.com');
+  // bms-ready goes once to each exact allowed origin, never to '*'.
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent.map(item => item.targetOrigin), [ROOT_ORIGIN, VIEW_ORIGIN]);
+  for (const item of sent) {
+    assert.deepEqual({ ...item.message }, {
+      type: 'besender-tools:bms-ready',
+      protocol: 1,
+      popupNonce: 'popup_nonce_1234567890abcdef',
+      expiresInMs: 30000,
+    });
+  }
 
   const raw = 'warehouse_token_1234567890.abcdef';
   const transfer = {
@@ -334,23 +349,23 @@ test('BMS receiver accepts one nonce-bound transfer only from the exact Dashboar
     origin: 'https://evil.example', source: dashboardWindow, data: transfer,
   });
   window.emit('message', {
-    origin: 'https://dashboard.besender.lyp04.com', source: {}, data: transfer,
+    origin: VIEW_ORIGIN, source: {}, data: transfer,
   });
   window.emit('message', {
-    origin: 'https://dashboard.besender.lyp04.com', source: dashboardWindow,
+    origin: VIEW_ORIGIN, source: dashboardWindow,
     data: { ...transfer, popupNonce: 'wrong_nonce_1234567890' },
   });
   assert.equal(document.writes.length, 0);
-  assert.equal(sent.length, 1);
+  assert.equal(sent.length, 2);
 
   window.emit('message', {
-    origin: 'https://dashboard.besender.lyp04.com', source: dashboardWindow, data: transfer,
+    origin: VIEW_ORIGIN, source: dashboardWindow, data: transfer,
   });
   assert.equal(document.writes.length, 1);
   assert.equal(window.listenerCount('message'), 0);
   assert.equal(window.opener, null);
-  assert.equal(sent.length, 2);
-  assert.deepEqual({ ...sent[1].message }, {
+  assert.equal(sent.length, 3);
+  assert.deepEqual({ ...sent[2].message }, {
     type: 'besender-tools:handoff-result',
     protocol: 1,
     requestId: 'request_1234567890abcdef',
@@ -360,19 +375,106 @@ test('BMS receiver accepts one nonce-bound transfer only from the exact Dashboar
     error: null,
     destination: 'warehouse',
   });
-  assert.equal(sent[1].targetOrigin, 'https://dashboard.besender.lyp04.com');
+  // The result goes only back to the origin that sent the transfer.
+  assert.equal(sent[2].targetOrigin, VIEW_ORIGIN);
   assert.doesNotMatch(JSON.stringify(sent), new RegExp(raw));
 
   // The listener is gone, so replaying the structured message cannot write again.
   window.emit('message', {
-    origin: 'https://dashboard.besender.lyp04.com', source: dashboardWindow, data: transfer,
+    origin: VIEW_ORIGIN, source: dashboardWindow, data: transfer,
   });
   assert.equal(document.writes.length, 1);
-  assert.equal(sent.length, 2);
+  assert.equal(sent.length, 3);
   assert.equal(harness.timerCount(), 1, 'only the post-success navigation timer remains');
   harness.runTimers();
   assert.equal(location.replacedWith, 'https://bms.besender.com/bsd-warehouse/home');
   assert.equal(harness.storageWrites.length, 0);
+});
+
+test('BMS receiver also accepts the root origin and replies only to it', () => {
+  const harness = loadBridgeHarness({ pathname: '/bsd-warehouse/home' });
+  const { hooks, window, document } = harness;
+  const sent = [];
+  const dashboardWindow = {
+    postMessage(message, targetOrigin) { sent.push({ message, targetOrigin }); },
+  };
+  window.opener = dashboardWindow;
+  const receiver = hooks.installBmsSessionReceiver();
+  const readyCount = sent.length;
+
+  window.emit('message', {
+    origin: ROOT_ORIGIN,
+    source: dashboardWindow,
+    data: {
+      type: 'besender-tools:token-transfer',
+      protocol: 1,
+      requestId: 'request_root_origin_123456',
+      popupNonce: receiver.popupNonce,
+      token: 'warehouse_token_1234567890.abcdef',
+      userType: 3,
+    },
+  });
+  assert.equal(document.writes.length, 1);
+  assert.equal(sent.length, readyCount + 1);
+  assert.equal(sent.at(-1).targetOrigin, ROOT_ORIGIN);
+  assert.equal(sent.at(-1).message.ok, true);
+});
+
+test('BMS receiver rejects look-alike, non-https, ported and other-subdomain origins', () => {
+  const rejected = [
+    'https://evilbesender.lyp04.com',
+    'https://besender.lyp04.com.evil.com',
+    'https://evil.com/besender.lyp04.com',
+    'https://besender.lyp04.com@evil.com',
+    'http://besender.lyp04.com',
+    'http://view.besender.lyp04.com',
+    'https://besender.lyp04.com:8443',
+    'https://view.besender.lyp04.com:8443',
+    'https://pack.besender.lyp04.com',
+    'https://a.view.besender.lyp04.com',
+    'https://dashboard.besender.lyp04.com',
+    'https://BESENDER.LYP04.COM.',
+    'https://besender.lyp04.com/',
+    'null',
+    '',
+    undefined,
+  ];
+  for (const origin of rejected) {
+    const harness = loadBridgeHarness({ pathname: '/bsd-warehouse/home' });
+    const { hooks, window, document } = harness;
+    const sent = [];
+    const dashboardWindow = {
+      postMessage(message, targetOrigin) { sent.push({ message, targetOrigin }); },
+    };
+    window.opener = dashboardWindow;
+    const receiver = hooks.installBmsSessionReceiver();
+    const readyCount = sent.length;
+    window.emit('message', {
+      origin,
+      source: dashboardWindow,
+      data: {
+        type: 'besender-tools:token-transfer',
+        protocol: 1,
+        requestId: 'request_reject_1234567890',
+        popupNonce: receiver.popupNonce,
+        token: 'warehouse_token_1234567890.abcdef',
+        userType: 3,
+      },
+    });
+    assert.equal(document.writes.length, 0, `origin ${origin} must not write a cookie`);
+    assert.equal(sent.length, readyCount, `origin ${origin} must get no reply`);
+    assert.equal(window.listenerCount('message'), 1, `origin ${origin} must not consume the nonce`);
+  }
+});
+
+test('bms-ready is never posted with a wildcard target origin', () => {
+  const { hooks, window } = loadBridgeHarness({ pathname: '/bsd-warehouse/home' });
+  const targets = [];
+  window.opener = { postMessage(_message, targetOrigin) { targets.push(targetOrigin); } };
+  hooks.installBmsSessionReceiver();
+  assert.ok(targets.length > 0);
+  assert.equal(targets.includes('*'), false);
+  assert.ok(targets.every(origin => origin === ROOT_ORIGIN || origin === VIEW_ORIGIN));
 });
 
 test('BMS receiver rejects unsupported roles without writing a cookie or leaking the token', () => {
@@ -387,7 +489,7 @@ test('BMS receiver rejects unsupported roles without writing a cookie or leaking
   const raw = 'partner_token_1234567890.abcdef';
 
   window.emit('message', {
-    origin: 'https://dashboard.besender.lyp04.com',
+    origin: VIEW_ORIGIN,
     source: dashboardWindow,
     data: {
       type: 'besender-tools:token-transfer',
@@ -403,6 +505,7 @@ test('BMS receiver rejects unsupported roles without writing a cookie or leaking
   assert.equal(sent.at(-1).message.code, 'unsupported_user_type');
   assert.equal(sent.at(-1).message.error, 'unsupported_user_type');
   assert.equal(sent.at(-1).message.ok, false);
+  assert.equal(sent.at(-1).targetOrigin, VIEW_ORIGIN);
   assert.doesNotMatch(JSON.stringify(sent), new RegExp(raw));
   assert.equal(window.listenerCount('message'), 0);
 });
