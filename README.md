@@ -37,7 +37,7 @@ Dashboard 自己负责在按钮的同步点击处理器中调用 `window.open` �
 - 探测：`besender-dashboard:probe`，`detail = { protocol: 1, requestId }`
 - 就绪：`besender-tools:ready`，`detail = { protocol: 1, requestId, receiver, capabilities }`
 
-脚本只认两个 Dashboard 来源，按完整 origin 精确比较：`https://besender.lyp04.com` 和 `https://view.besender.lyp04.com`（数据面板）。旧看板 `dashboard.besender.lyp04.com` 已下线，不再认。
+脚本只认两个 Dashboard 来源，按完整 origin 精确比较：`https://besender.lyp04.com` 和 `https://dashboard.besender.lyp04.com`（数据面板，2026-10-01 起的正式域名）。原来的 `view.besender.lyp04.com` 现在只做跳转，不再认。
 
 BMS popup 与 Dashboard 之间只使用带精确 `targetOrigin` 的 `postMessage`：
 
@@ -64,6 +64,7 @@ git push
 
 ## 历史
 
+- v1.14.0 — 数据面板正式域名从 `view.besender.lyp04.com` 改为 `dashboard.besender.lyp04.com`：来源白名单和 `@match` 同步换成新域名，旧的 view 不再认，协议不变
 - v1.13.0 — 会话交接改认数据面板：来源从下线的旧看板换成 `besender.lyp04.com` 和 `view.besender.lyp04.com`，`bms-ready` 对两个来源各发一次，协议不变
 - v1.12.0 — 先读账号时区：BMS 的原始时间与 `start/end` 查询窗口都按登录账号资料的 `timezone` 解释（任意 IANA 时区、夏令时按真实偏移），不再固定按中国时间；页面时间装饰、悬停提示、翻新聚合、头程入库 ETA、售后维修统计全部随账号时区换算，读不到时回退 `Asia/Shanghai` 并在面板提示。起因：换用 `Asia/Shanghai` 账号后 BMS 把洛杉矶白天的行整体 +15 h，"今天"变成昨天的复制版
 - v1.11.0 — Dashboard 可用同一 token 一次性打开 BMS：短时 nonce + origin/source/角色白名单校验，按角色写 BMS 当前会话 Cookie；BMS 头像菜单新增可访问的「复制 Token」，复制裸 `access_token`，不把 token 放入 DOM、URL、日志或 userscript/服务端持久存储
