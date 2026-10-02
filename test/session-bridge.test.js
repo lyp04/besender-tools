@@ -10,7 +10,7 @@ const sourcePath = path.join(__dirname, '..', 'besender-aggregate.user.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 
 const ROOT_ORIGIN = 'https://besender.lyp04.com';
-const VIEW_ORIGIN = 'https://view.besender.lyp04.com';
+const VIEW_ORIGIN = 'https://dashboard.besender.lyp04.com';
 
 class FakeClassList {
   constructor() { this.values = new Set(); }
@@ -260,8 +260,8 @@ test('userscript metadata is narrowly scoped and runs before BMS application cod
   assert.match(source, /@match\s+https:\/\/bms\.besender\.com\/bsd-warehouse\/\*/);
   assert.match(source, /@match\s+https:\/\/bms\.besender\.com\/bsdAdmin\/\*/);
   assert.match(source, /@match\s+https:\/\/besender\.lyp04\.com\/\*/);
-  assert.match(source, /@match\s+https:\/\/view\.besender\.lyp04\.com\/\*/);
-  assert.doesNotMatch(source, /dashboard\.besender\.lyp04\.com/);
+  assert.match(source, /@match\s+https:\/\/dashboard\.besender\.lyp04\.com\/\*/);
+  assert.doesNotMatch(source, /view\.besender\.lyp04\.com/);
   assert.doesNotMatch(source, /@match\s+https:\/\/\*\./);
   assert.match(source, /@run-at\s+document-start/);
   assert.match(source, /@noframes/);
@@ -427,12 +427,12 @@ test('BMS receiver rejects look-alike, non-https, ported and other-subdomain ori
     'https://evil.com/besender.lyp04.com',
     'https://besender.lyp04.com@evil.com',
     'http://besender.lyp04.com',
-    'http://view.besender.lyp04.com',
+    'http://dashboard.besender.lyp04.com',
     'https://besender.lyp04.com:8443',
-    'https://view.besender.lyp04.com:8443',
+    'https://dashboard.besender.lyp04.com:8443',
     'https://pack.besender.lyp04.com',
-    'https://a.view.besender.lyp04.com',
-    'https://dashboard.besender.lyp04.com',
+    'https://a.dashboard.besender.lyp04.com',
+    'https://view.besender.lyp04.com',
     'https://BESENDER.LYP04.COM.',
     'https://besender.lyp04.com/',
     'null',
