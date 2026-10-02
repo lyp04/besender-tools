@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         BESENDER 良品/不良品聚合统计
 // @namespace    https://bms.besender.com/
-// @version      1.13.0
+// @version      1.14.0
 // @description  BESENDER 业务统计、Dashboard 同 token 打开 BMS，以及 BMS 头像菜单安全复制 Token。
 // @author       YupengLai
 // @match        https://bms.besender.com/bsd-warehouse/*
 // @match        https://bms.besender.com/bsdAdmin/*
 // @match        https://besender.lyp04.com/*
-// @match        https://view.besender.lyp04.com/*
+// @match        https://dashboard.besender.lyp04.com/*
 // @run-at       document-start
 // @grant        none
 // @noframes
@@ -82,7 +82,7 @@
   // other subdomains). The popup cannot read its opener's origin, so bms-ready is
   // posted once to each of these with an explicit targetOrigin (a non-matching
   // origin is silently dropped by the browser); never '*'.
-  const DASHBOARD_ORIGINS = ['https://besender.lyp04.com', 'https://view.besender.lyp04.com'];
+  const DASHBOARD_ORIGINS = ['https://besender.lyp04.com', 'https://dashboard.besender.lyp04.com'];
   const BMS_ORIGIN = 'https://bms.besender.com';
   const BMS_WAREHOUSE_HOME_URL = BMS_ORIGIN + '/bsd-warehouse/home';
   const BMS_ADMIN_HOME_URL = BMS_ORIGIN + '/bsdAdmin/home';
